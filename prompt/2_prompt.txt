@@ -1,0 +1,26 @@
+你在 Windows PowerShell 5.1 里执行命令。不要做任何“编码识别/探测脚本”，不要打印整个 md 文档内容；直接按文档步骤执行即可。
+文档保证是 UTF-8（如显示乱码也当作“显示问题”，不要进入编码检测流程）。
+
+【参数】
+SYMBOL=PIPPINUSDT
+PROFILE=MED
+SKILL_FILE=futures_snapshot_scalp_skill_2-4h_utf8bom.md
+
+【从现在开始严格执行】
+1) 先执行以下编码设置（逐条执行一次）：
+chcp 65001
+$OutputEncoding = New-Object System.Text.UTF8Encoding $false
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
+$PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
+$PSDefaultParameterValues['Set-Content:Encoding'] = 'utf8'
+$PSDefaultParameterValues['Add-Content:Encoding'] = 'utf8'
+
+2) 不要用 type / cat 直接读文件；读取 skills 文件时必须显式 UTF-8：
+$skill = Get-Content -Raw -Encoding utf8 .\${SKILL_FILE} | Out-String
+（不要把 $skill 全文打印出来）
+
+3) 现在开始：打开并严格遵循 ${SKILL_FILE} 的所有步骤；把 SYMBOL 替换为上面各个的 SYMBOL，把 PROFILE 替换为上面的 PROFILE，从 Step 0 开始执行。
+
+4) 输出报告保存时：必须用 Set-Content/Out-File 且 -Encoding utf8；禁止使用 > 或 >> 重定向。
