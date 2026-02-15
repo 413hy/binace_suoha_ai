@@ -10,6 +10,9 @@
 3. 分析阶段：只允许读取一次最新 `snapshot_<SYMBOL>_*.json`（全文一次）；不要读 `_agent.txt`；不要重复读 JSON。
 4. 输出必须保存为 `analysis_<SYMBOL>_<server_time_ms>.txt`，**UTF-8**。PowerShell 5.1 下**禁止**用 `>` / `>>` 重定向保存（常导致中文 `????`）。必须用 `Set-Content/Out-File` 且显式 `-Encoding utf8`。
 5. 若数据质量不足（见 Step 5）必须 **WAIT**；宁可保守也不要猜。若 `errors_count>0`，则 **置信度<=50**。
+6. `data.py` 固定路径为 `.\scripts\data.py`；不要假设在仓库根目录。
+7. PowerShell 5.1 兼容：`ConvertFrom-Json` **不要加 `-Depth`**；不要使用 `?:` 三元表达式。
+8. 所有输出（snapshot / analysis）统一写到 `.\logs\`，避免跨会话混杂与找错文件。
 
 ---
 
@@ -17,6 +20,8 @@
 ```powershell
 $SYMBOL  = "DOGEUSDT"   # 例如 DOGEUSDT / SOMIUSDT / BTCUSDT
 $PROFILE = "MED"       # MED=更全但还算快（推荐短线）；FULL=更慢更重
+$DATA_PY = ".\scripts\data.py"
+$LOG_DIR = ".\logs"
 ```
 
 ---
@@ -28,15 +33,17 @@ chcp 65001
 $OutputEncoding = New-Object System.Text.UTF8Encoding $false
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
 $env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
 $PSDefaultParameterValues['Set-Content:Encoding'] = 'utf8'
 $PSDefaultParameterValues['Add-Content:Encoding'] = 'utf8'
+if (!(Test-Path $LOG_DIR)) { New-Item -ItemType Directory -Path $LOG_DIR -Force | Out-Null }
 ```
 
 ---
 
 ## Step 1) 运行 data.py 生成快照（按 PROFILE）
-> 仅允许：`ls` 看一眼是否存在 `data.py`。不要写探测脚本。
+> 仅允许：`ls` 看一眼是否存在 `$DATA_PY`。不要写探测脚本。
 
 ### PROFILE=MED（推荐：更全且适合短线）
 - intervals：`3m 5m 15m 1h 4h 1d`（默认不含 1m，避免噪声/限流/脚本 interval 参数错误）
@@ -49,11 +56,13 @@ $PSDefaultParameterValues['Add-Content:Encoding'] = 'utf8'
 
 严格执行（**先 strict，失败只允许降级一次**）：
 ```powershell
-python data.py --symbol $SYMBOL --intervals 3m 5m 15m 1h 4h 1d --kline-limit 500 --hist-period 30m --hist-limit 240 --depth 100 --include-exchange-info --include-trades --trades-limit 1000 --strict
+$RUN_ID = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+$OUT_JSON = Join-Path $LOG_DIR ("snapshot_{0}_{1}.json" -f $SYMBOL, $RUN_ID)
+python $DATA_PY --symbol $SYMBOL --intervals 3m 5m 15m 1h 4h 1d --kline-limit 500 --hist-period 30m --hist-limit 240 --depth 100 --include-exchange-info --include-trades --trades-limit 1000 --out $OUT_JSON --strict
 ```
 若返回码非 0：只允许降级一次（去掉 `--strict`）：
 ```powershell
-python data.py --symbol $SYMBOL --intervals 3m 5m 15m 1h 4h 1d --kline-limit 500 --hist-period 30m --hist-limit 240 --depth 100 --include-exchange-info --include-trades --trades-limit 1000
+python $DATA_PY --symbol $SYMBOL --intervals 3m 5m 15m 1h 4h 1d --kline-limit 500 --hist-period 30m --hist-limit 240 --depth 100 --include-exchange-info --include-trades --trades-limit 1000 --out $OUT_JSON
 ```
 若仍非 0：停止，打印错误，不要继续分析。
 
@@ -68,21 +77,23 @@ python data.py --symbol $SYMBOL --intervals 3m 5m 15m 1h 4h 1d --kline-limit 500
 
 执行（strict 失败只允许降级一次）：
 ```powershell
-python data.py --symbol $SYMBOL --intervals 1m 3m 5m 15m 1h 4h 1d --kline-limit 800 --hist-period 15m --hist-limit 480 --depth 200 --include-exchange-info --include-trades --trades-limit 1000 --strict
+$RUN_ID = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+$OUT_JSON = Join-Path $LOG_DIR ("snapshot_{0}_{1}.json" -f $SYMBOL, $RUN_ID)
+python $DATA_PY --symbol $SYMBOL --intervals 1m 3m 5m 15m 1h 4h 1d --kline-limit 800 --hist-period 15m --hist-limit 480 --depth 200 --include-exchange-info --include-trades --trades-limit 1000 --out $OUT_JSON --strict
 ```
 降级一次（去掉 `--strict`）后仍失败则停止。
 
 ---
 
 ## Step 2) 找到最新 snapshot JSON（必须）
-必须找到当前目录最新的：
+必须找到 `$LOG_DIR` 下最新的：
 - `snapshot_<SYMBOL>_*.json`
 
-若找不到：停止并列出当前目录所有 `snapshot_*.json` 文件名。
+若找不到：停止并列出 `$LOG_DIR` 下所有 `snapshot_*.json` 文件名。
 
 推荐命令：
 ```powershell
-Get-ChildItem -File -Filter "snapshot_$($SYMBOL)_*.json" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 FullName,Name,LastWriteTime
+Get-ChildItem -File -Path $LOG_DIR -Filter "snapshot_$($SYMBOL)_*.json" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 FullName,Name,LastWriteTime
 ```
 把选中的路径记为：`$SNAP_PATH`
 
@@ -233,6 +244,7 @@ data_quality：...
 
 保存方式：
 ```powershell
+$outFile = Join-Path $LOG_DIR ("analysis_{0}_{1}.txt" -f $SYMBOL, $meta.server_time_ms)
 $report | Set-Content -Encoding utf8 -Path $outFile
 ```
 

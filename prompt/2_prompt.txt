@@ -2,9 +2,11 @@
 文档保证是 UTF-8（如显示乱码也当作“显示问题”，不要进入编码检测流程）。
 
 【参数】
-SYMBOL=PIPPINUSDT
+SYMBOL=XRPUSDT BTCUSDT ETHUSDT
 PROFILE=MED
-SKILL_FILE=futures_snapshot_scalp_skill_2-4h_utf8bom.md
+SKILL_FILE=SKILL.md
+DATA_PY=.\scripts\data.py
+LOG_DIR=.\logs
 
 【从现在开始严格执行】
 1) 先执行以下编码设置（逐条执行一次）：
@@ -16,11 +18,16 @@ $env:PYTHONUTF8 = "1"
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
 $PSDefaultParameterValues['Set-Content:Encoding'] = 'utf8'
 $PSDefaultParameterValues['Add-Content:Encoding'] = 'utf8'
+if (!(Test-Path ${LOG_DIR})) { New-Item -ItemType Directory -Path ${LOG_DIR} -Force | Out-Null }
 
 2) 不要用 type / cat 直接读文件；读取 skills 文件时必须显式 UTF-8：
 $skill = Get-Content -Raw -Encoding utf8 .\${SKILL_FILE} | Out-String
 （不要把 $skill 全文打印出来）
 
-3) 现在开始：打开并严格遵循 ${SKILL_FILE} 的所有步骤；把 SYMBOL 替换为上面各个的 SYMBOL，把 PROFILE 替换为上面的 PROFILE，从 Step 0 开始执行。
+3) 现在开始：打开并严格遵循 ${SKILL_FILE} 的所有步骤；把 SYMBOL 替换为上面每个 SYMBOL，把 PROFILE 替换为上面的 PROFILE，从 Step 0 开始执行。
+   - data.py 路径固定用 ${DATA_PY}
+   - snapshot / analysis 输出都写入 ${LOG_DIR}
+   - 每个 SYMBOL 都要输出 Step 9 的两行确认
+   - PowerShell 5.1 兼容：禁止使用 `ConvertFrom-Json -Depth`；禁止使用 `?:` 三元表达式
 
 4) 输出报告保存时：必须用 Set-Content/Out-File 且 -Encoding utf8；禁止使用 > 或 >> 重定向。
