@@ -1,33 +1,35 @@
-﻿# Futures Snapshot Scalp Skill（短线 2~4 小时）
-> 适用：在 **PowerShell 5.1** 里运行 `data.py` 生成合约快照 `snapshot_<SYMBOL>_*.json`，然后只读一次 JSON 做 2~4 小时短线决策（LONG/SHORT/WAIT），并把报告保存为 UTF-8 文本。  
-> 目标：**防误判**（先做数据充分性门槛 + 多周期一致性 + 微观确认 + 拥挤风险），宁可保守。
+﻿# Spot Snapshot Scalp Skill（Binance.US，30~60 分钟，高准确度模式）
+> 适用：在 **PowerShell 5.1** 里运行 `data.py` 生成现货快照 `snapshot_<SYMBOL>_*.json`，然后只读一次 JSON 做 30~60 分钟决策（LONG/SHORT/WAIT）。  
+> 目标：优先提高 long/short 准度（目标 70%+），允许覆盖率下降，但避免机械性全 WAIT。
 
 ---
 
 ## 硬规则（必须遵守）
-1. **禁止写临时 debug 脚本**；禁止反复探测结构；禁止多次读取同一 JSON。
-2. 必须先运行 `data.py` 生成 **该 SYMBOL 的 snapshot_*.json（全量）**。
-3. 分析阶段：只允许读取一次最新 `snapshot_<SYMBOL>_*.json`（全文一次）；不要读 `_agent.txt`；不要重复读 JSON。
-4. 输出必须保存为 `analysis_<SYMBOL>_<server_time_ms>.txt`，**UTF-8**。PowerShell 5.1 下**禁止**用 `>` / `>>` 重定向保存（常导致中文 `????`）。必须用 `Set-Content/Out-File` 且显式 `-Encoding utf8`。
-5. 若数据质量不足（见 Step 5）必须 **WAIT**；宁可保守也不要猜。若 `errors_count>0`，则 **置信度<=50**。
-6. `data.py` 固定路径为 `.\scripts\data.py`；不要假设在仓库根目录。
-7. PowerShell 5.1 兼容：`ConvertFrom-Json` **不要加 `-Depth`**；不要使用 `?:` 三元表达式。
-8. 所有输出（snapshot / analysis）统一写到 `.\logs\`，避免跨会话混杂与找错文件。
+1. 禁止写临时 debug 脚本；禁止多次读取同一 JSON。
+2. 必须先运行 `.\scripts\data.py` 生成该 SYMBOL 的最新 snapshot。
+3. 分析阶段只允许读取一次最新 snapshot JSON（全文一次）。
+4. 输出报告必须是 UTF-8，PowerShell 5.1 禁止用 `>`/`>>` 保存报告。
+5. 若数据质量不足必须 WAIT；若 `errors_count>0`，置信度上限 50。
+6. 所有输出统一写到 `.\logs\`。
+7. 若 `diagnostics.self_check.status=FAIL`，本轮直接终止并先修复报错根因。
+8. 本流程用于实盘实时分析，禁止调用 `scripts/backtest_random_nodes.py` 或历史时间戳回放。
+9. 报告必须使用 ASCII 段落标签（如 `[FINAL_DECISION]`），避免终端中文乱码影响可审计性。
+10. 禁止黑盒结论：每条结论后必须跟字段证据（字段路径 + 数值）。
 
 ---
 
 ## 变量区（只改这里）
 ```powershell
-$SYMBOL  = "DOGEUSDT"   # 例如 DOGEUSDT / SOMIUSDT / BTCUSDT
-$PROFILE = "MED"       # MED=更全但还算快（推荐短线）；FULL=更慢更重
+$SYMBOL  = "BTCUSDT"
+$PROFILE = "MED"
 $DATA_PY = ".\scripts\data.py"
+$GUARD_PY = ".\scripts\decision_guard.py"
 $LOG_DIR = ".\logs"
 ```
 
 ---
 
 ## Step 0) PowerShell 5.1 编码环境（逐条执行）
-> 目的：让 **终端输出 + 写文件** 都是 UTF-8，减少 `????`。
 ```powershell
 chcp 65001
 $OutputEncoding = New-Object System.Text.UTF8Encoding $false
@@ -42,222 +44,193 @@ if (!(Test-Path $LOG_DIR)) { New-Item -ItemType Directory -Path $LOG_DIR -Force 
 
 ---
 
-## Step 1) 运行 data.py 生成快照（按 PROFILE）
-> 仅允许：`ls` 看一眼是否存在 `$DATA_PY`。不要写探测脚本。
-
-### PROFILE=MED（推荐：更全且适合短线）
-- intervals：`3m 5m 15m 1h 4h 1d`（默认不含 1m，避免噪声/限流/脚本 interval 参数错误）
-- kline_limit：`500`
-- hist_period：`30m`
-- hist_limit：`240`（约 5 天 30m 统计）
-- depth：`100`
-- include-exchange-info：开启
-- include-trades：开启（trades_limit 1000）
-
-严格执行（**先 strict，失败只允许降级一次**）：
+## Step 0.5) 会话自检（防重复报错）
+每次新会话先跑一次：
 ```powershell
-$RUN_ID = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-$OUT_JSON = Join-Path $LOG_DIR ("snapshot_{0}_{1}.json" -f $SYMBOL, $RUN_ID)
-python $DATA_PY --symbol $SYMBOL --intervals 3m 5m 15m 1h 4h 1d --kline-limit 500 --hist-period 30m --hist-limit 240 --depth 100 --include-exchange-info --include-trades --trades-limit 1000 --out $OUT_JSON --strict
+python .\scripts\self_check.py --symbol $SYMBOL
 ```
-若返回码非 0：只允许降级一次（去掉 `--strict`）：
-```powershell
-python $DATA_PY --symbol $SYMBOL --intervals 3m 5m 15m 1h 4h 1d --kline-limit 500 --hist-period 30m --hist-limit 240 --depth 100 --include-exchange-info --include-trades --trades-limit 1000 --out $OUT_JSON
-```
-若仍非 0：停止，打印错误，不要继续分析。
-
-### PROFILE=FULL（更慢更重：只有 MED 数据质量不足才用）
-- intervals：`1m 3m 5m 15m 1h 4h 1d`（含 1m）
-- kline_limit：`800`
-- hist_period：`15m`
-- hist_limit：`480`
-- depth：`200`
-- include-exchange-info：开启
-- include-trades：开启（trades_limit 1000）
-
-执行（strict 失败只允许降级一次）：
-```powershell
-$RUN_ID = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-$OUT_JSON = Join-Path $LOG_DIR ("snapshot_{0}_{1}.json" -f $SYMBOL, $RUN_ID)
-python $DATA_PY --symbol $SYMBOL --intervals 1m 3m 5m 15m 1h 4h 1d --kline-limit 800 --hist-period 15m --hist-limit 480 --depth 200 --include-exchange-info --include-trades --trades-limit 1000 --out $OUT_JSON --strict
-```
-降级一次（去掉 `--strict`）后仍失败则停止。
+- 若输出 `status=FAIL`：先按 `logs\self_check_*.json` 的 `issues.fail` 修复，再继续。
+- 若输出 `status=WARN`：可继续，但必须在报告中写明风险来源。
 
 ---
 
-## Step 2) 找到最新 snapshot JSON（必须）
-必须找到 `$LOG_DIR` 下最新的：
-- `snapshot_<SYMBOL>_*.json`
+## Step 1) 抓取快照（Binance.US）
+### PROFILE=MED（默认）
+- intervals：`1m 3m 5m 15m 30m 1h`
+- kline_limit：`360`
+- hist_period：`15m`
+- hist_limit：`192`
+- depth：`150`
+- include-exchange-info：开启
+- include-trades：开启
 
-若找不到：停止并列出 `$LOG_DIR` 下所有 `snapshot_*.json` 文件名。
+```powershell
+$RUN_ID = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+$OUT_JSON = Join-Path $LOG_DIR ("snapshot_{0}_{1}.json" -f $SYMBOL, $RUN_ID)
+python $DATA_PY --symbol $SYMBOL --intervals 1m 3m 5m 15m 30m 1h --kline-limit 360 --hist-period 15m --hist-limit 192 --depth 150 --include-exchange-info --include-trades --trades-limit 1000 --out $OUT_JSON --strict
+```
+strict 失败只允许降级一次（去掉 `--strict`）。
 
-推荐命令：
+---
+
+## Step 2) 定位最新 snapshot
 ```powershell
 Get-ChildItem -File -Path $LOG_DIR -Filter "snapshot_$($SYMBOL)_*.json" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 FullName,Name,LastWriteTime
 ```
-把选中的路径记为：`$SNAP_PATH`
 
 ---
 
-## Step 3) 只读取一次 JSON（全文一次）
-只允许一次：
-- `Get-Content -Raw -Encoding utf8 $SNAP_PATH`
-- 解析为对象（一次），然后只在内存里使用。
-
-必须提取以下字段路径（缺失记为 NULL/空）：
-- `meta.server_time_ms`
-- `meta.server_time`
-- `meta.generated_at`
-- `errors`（字典；`errors_count = 键数量`）
-- `market.ticker_24h.lastPrice`
-- `market.premium_index.markPrice`
-- `market.premium_index.lastFundingRate`
-- `market.premium_index.nextFundingTime`
-- `funding.current_rate`（若存在）
-- `funding.annualized_pct`（若存在）
-- `funding.history`（list）
-- `open_interest.current`（dict）
-- `open_interest.history`（list）
-- `open_interest.change_from_prev_pct`
-- `flow.taker_buy_sell_volume`（list）
-- `sentiment.global_long_short_account_ratio`（list）
-- `sentiment.top_long_short_account_ratio`（list）
-- `sentiment.top_long_short_position_ratio`（list）
-- `basis`（list）
-- `order_book.bids` / `order_book.asks`（list）
-- `features.last_close / features.rsi14_last / features.atr14_last / features.ema20_last / features.ema50_last`
-- `features.order_book.spread_bps / features.order_book.imbalance`
-- `candles.regular["15m"]`（list[dict]）
-- `candles.regular["1h"]`（list[dict]）
-- `candles.regular["4h"]`（list[dict]）
-- （若 intervals 含 3m/5m/1m，也同时取对应 `candles.regular[...]`）
-可选：
-- `trades`（list）
+## Step 3) 只读一次 JSON 并提取关键字段
+必须提取：
+- `meta.server_time_ms / server_time / generated_at`
+- `errors`
+- `diagnostics.self_check.status / failed_critical / failed`
+- `diagnostics.error_diagnostics`
+- `market.ticker_24h / ticker_1h / ticker_4h / book_ticker / avg_price`
+- `order_book.bids / asks`
+- `features.order_book.spread_bps / imbalance`
+- `features.book_ticker.spread_bps / imbalance_top`
+- `flow.trade_features.buy_sell_ratio / imbalance_qty / recent_count / agg_count`
+- `features.ticker_window.h1/h4.price_change_pct / range_pct`
+- `features.by_interval["5m"/"15m"/"30m"/"1h"]`
+- `candles.regular["5m"/"15m"/"30m"/"1h"]`
 
 ---
 
-## Step 4) 慎重分析流程（不能跳）
-A) 数据质量检查（Step 5）→ 不达标直接 **WAIT**  
-B) 多周期一致性：15m + 1h + 4h 分别判断趋势/动能，再看是否一致  
-C) 微观确认：盘口(imbalance/spread) + taker + long/short ratio  
-D) 拥挤与风险：funding（当前+最近8条）+ basis（最近8条）  
-E) 交叉验证：若冲突≥2项，下调置信度并倾向 WAIT  
-F) 最后输出：方向 + 触发式入场 + 止损止盈（ATR 可用才给数值）
+## Step 4) 数据质量门槛（高准确度模式）
+- K1 `lastPrice` 非空
+- K2 orderbook 非空且 spread/imbalance 非空
+- K3 candles：`5m>=120` 且 `15m>=96` 且（`30m>=72` 或 `1h>=48`）
+- K4 trade_flow：`recent_count + agg_count >= 80`
+- K5 ticker_window：`h1/h4 price_change_pct` 都存在
+- K6 book_ticker spread 存在
+- K7 freshness：快照到分析时刻 <= 20 分钟
 
----
-
-## Step 5) 数据充分性门槛（强制防误判）
-关键模块门槛（缺任意项要降级）：
-- **K1 price**：`market.premium_index.markPrice` 或 `market.ticker_24h.lastPrice` 至少一个非 NULL
-- **K2 orderbook**：`order_book.bids/asks` 非空 且 `features.order_book.spread_bps` & `features.order_book.imbalance` 非 NULL
-- **K3 candles**：`15m>=120` 且 `1h>=72` 且 `4h>=72`
-- **K4 funding**：`funding.history>=50` 且（`funding.current_rate` 或 `premium_index.lastFundingRate`）非 NULL
-- **K5 oi**：`open_interest.history>=24` 或 `open_interest.change_from_prev_pct` 非 NULL
-- **K6 taker**：`flow.taker_buy_sell_volume>=24`
-- **K7 sentiment**：`global_long_short_account_ratio>=24`
-- **K8 errors**：`errors_count=0` 最佳；若 >0 必须降置信度上限
-
-data_quality 判定：
-- **HIGH**：errors_count=0 且 K1~K7 全部满足
-- **MED**：errors_count=0 且缺 1~2 项；或 errors_count>0 但关键模块都在
-- **LOW**：缺>=3项；或 price 缺失；或 candles 严重不足
+判定：
+- HIGH：缺失 <=2 且 errors=0
+- MED：缺失 3~4 或 errors>0
+- LOW：缺失 >=5 或 K1/K3/K7 失败
 
 强制规则：
-- data_quality=LOW ⇒ 行动必须 **WAIT** 且 **置信度<=40**
-- errors_count>0 ⇒ **置信度<=50**
-- ATR 缺失（`features.atr14_last=NULL`）⇒ 允许给方向，但 **止损/止盈不得给具体价格**（只能给条件）且 **置信度至少 -10**
+- LOW => WAIT 且置信度<=35
+- errors_count>0 => 置信度<=50
+- `diagnostics.self_check.status=FAIL` => WAIT 且必须先修复后再重跑
 
 ---
 
-## Step 6) 分析指标（短线 2~4 小时）
-价格口径：
-- 若 `market.premium_index.markPrice` 非 NULL：`price_used=markPrice`
-- 否则：`price_used=lastPrice`
+## Step 5) 高准确度模式分析（30~60 分钟）
+### 趋势层
+- 5m：EMA20/EMA50 + RSI14
+- 15m：EMA20/EMA50 + RSI14（主方向）
+- 1h：方向过滤（与 15m 冲突则扣分）
 
-多周期判断（必须写在理由里）：
-- 15m：最近 40 根 close 的变化/动能
-- 1h：ema20 vs ema50 + rsi14
-- 4h：趋势是否与 1h 一致（不一致要写冲突并降置信度）
+### 微观层
+- orderbook spread/imbalance
+- bookTicker spread（盘口是否骤然变薄）
+- trade flow：`buy_sell_ratio`、`imbalance_qty`
 
-微观确认：
-- imbalance：>0 偏多；<0 偏空
-- spread_bps：越大越不稳（降置信度）
-- taker：buySellRatio 与方向一致加分，背离减分
-- long/short：与方向一致加分，背离减分
+### 波动与节奏
+- 15m ATR
+- h1/h4 range 与 price_change_pct（波动是否足够）
 
-风险/拥挤：
-- funding_annualized_pct 绝对值极高 ⇒ 降置信度倾向 WAIT
-- basis 最近值异常 ⇒ 降置信度
+### 行动准则（高准确度）
+- LONG：15m 偏多 + 5m 同向 + flow 偏多 + 1h 不明显反向
+- SHORT：15m 偏空 + 5m 同向 + flow 偏空 + 1h 不明显反向
+- WAIT：仅在多周期冲突明显或流向失真明显时使用
+- 约束：若 LONG/SHORT 核心条件齐全且置信度 >= 68，不应直接给 WAIT
 
-止损止盈（仅 ATR 存在才给数值）：
-- LONG：硬止损 = price - 1.5*ATR；TP1 = price + 1.0*ATR；TP2 = price + 2.0*ATR
-- SHORT：硬止损 = price + 1.5*ATR；TP1 = price - 1.0*ATR；TP2 = price - 2.0*ATR
-- 达到 TP1 后：剩余 20% 启用移动止损
-- ATR 缺失：止损止盈只写条件，不写价格
-
----
-
-## Step 7) 输出格式（严格固定模板）
-第一行：
-```
-snapshot_id=<文件名或symbol_ms> | snapshot_server_time_utc=<meta.server_time> | analysis_time_utc=<当前UTC> | analysis_time_local=<当前本地> | data_quality=<HIGH/MED/LOW>
-```
-
-正文（顺序固定）：
-- 【行动】LONG/SHORT/WAIT
-- 【置信度】xx/100（必须遵守上限）
-- 【关键理由】（1-6：必须“字段路径=数值 -> 含义”；缺失写缺失并说明影响）
-  1) `price_used(口径)=...=...; spread_bps=...; imbalance=...`
-  2) 15m：动能/方向（引用 candles）
-  3) 1h：`ema20_last vs ema50_last; rsi14_last`
-  4) 4h：与 1h 是否一致（冲突要写）
-  5) OI：`open_interest.change_from_prev_pct=...`
-  6) funding：`current_rate/lastFundingRate=...; annualized_pct=...; history最近8条走向=...`
-- 【入场】触发条件 + 明确口径(markPrice/lastPrice)
-- 【止损】硬止损=价格（ATR缺失则写无法给数值）；软止损=条件
-- 【止盈】TP1/TP2 + 20%移动止损（ATR缺失则写无法给数值）
-- 【仓位】固定5%，杠杆<=3x
-- 【无效条件】至少 2 条
-- 【数据健康】errors_count=<...>；missing_key_modules=<未满足的K项>
-- 【错误摘要】none 或 列出 errors 前<=5条（key/path/params）
-
-总结区（固定模板，只填内容）：
-```
-=== 总结 ===
-方向：...
-口径：markPrice或lastPrice=...
-入场：...
-止损：...
-止盈：...
-仓位/杠杆：5% / <=3x
-置信度：xx/100
-data_quality：...
-主要风险：...(最多2条)
-========
-```
+### 硬门槛（必须）
+- `LONG` 仅在 LONG_CORE 五项全部为 true 时允许；否则必须 WAIT。
+- `SHORT` 仅在 SHORT_CORE 五项全部为 true 时允许；否则必须 WAIT。
+- 若 `action=SHORT` 且 `rsi_1h<=34` 且 `ret_1h_pct>=0`，必须 WAIT（short_rebound_risk）。
+- 若 `flow_ratio<=0.97` 但 `imbalance>=0.08`，或 `flow_ratio>=1.03` 但 `imbalance<=-0.08`，必须 WAIT（flow_depth_divergence）。
+- 若 `abs(entry-book_mid)/max(1e-9,atr15) > 0.25`，必须 WAIT（entry_price_mismatch）。
 
 ---
 
-## Step 8) 保存到文件（必须 UTF-8；禁止 > / >>）
-文件名：
-- `analysis_<SYMBOL>_<meta.server_time_ms>.txt`
+## Step 6) 风控与退出
+- ATR 可用时：
+  - LONG：SL=`price-1.2*ATR`，TP1=`price+0.8*ATR`，TP2=`price+1.6*ATR`
+  - SHORT：SL=`price+1.2*ATR`，TP1=`price-0.8*ATR`，TP2=`price-1.6*ATR`
+- ATR 缺失：只给条件止损/止盈，不给具体价格
+- 超时退出：30~60 分钟未同向扩展（价格+flow 至少一项不确认）=> 降仓或平仓
+- 仓位固定 5%，杠杆提示 <=3x（若使用保证金）
 
-保存方式：
+---
+
+## Step 7) 输出模板（固定，audit_full_v1）
+第一行（固定）：
+```text
+snapshot_id=<...> | snapshot_server_time_utc=<...> | analysis_time_utc=<...> | analysis_time_local=<...> | horizon=30m~1h | mode=precision | data_quality=<HIGH/MED/LOW>
+```
+
+正文模块（按顺序，不得缺失）：
+- `[SNAPSHOT_META]`
+  - symbol / server_time / generated_at / snapshot_age_sec
+  - source_endpoints（本次实际用到）
+- `[DATA_QUALITY_GATE]`
+  - K1~K7 逐条输出：`Kx=<PASS|FAIL> | value=... | rule=...`
+  - 输出 `missing_key_modules=[...]`
+- `[FEATURE_TABLE]`
+  - lastPrice / ret_1h_pct / ret_4h_pct / range_1h_pct / range_4h_pct
+  - spread_bps / imbalance / flow_buy_sell_ratio / flow_imbalance_qty
+  - atr15 / rsi_5m / rsi_15m / rsi_1h
+- `[MULTI_TIMEFRAME]`
+  - 5m/15m/30m/1h 各自输出：EMA20 / EMA50 / RSI / trend_state
+  - 输出是否同向：`mtf_alignment=<aligned|partial|conflict>`
+- `[FLOW_AND_ORDERBOOK]`
+  - recent_count / agg_count / buy_qty / sell_qty / buy_sell_ratio
+  - orderbook_top_imbalance / spread_bps / liquidity_comment
+- `[SCORING_BREAKDOWN]`
+  - long_score / short_score / conflict_penalty / liquidity_penalty
+  - final_confidence（给出计算口径）
+- `[DECISION_TRACE]`
+  - LONG_CORE 条件逐条 true/false
+  - SHORT_CORE 条件逐条 true/false
+  - 输出 `core_complete=<true|false>` 与 `hard_blockers=[...]`
+  - WAIT 若出现，必须写明唯一主因和次因
+- `[RISK_PLAN]`
+  - entry_rule / entry_source / entry / entry_mid_diff / SL / TP1 / TP2 / position_size / leverage_cap
+- `[INVALIDATION_AND_TIMEOUT]`
+  - 至少2条 invalidation
+  - timeout_exit（30~60m）
+- `[COUNTER_SCENARIO]`
+  - 给出反方向成立所需条件（至少2条）
+- `[FINAL_DECISION]`
+  - action / confidence / data_quality / execution_note
+
+质量要求：
+- 不能只写“看多/看空”，必须给字段证据与阈值口径。
+- 每个模块至少 2 个“字段=数值”条目。
+- 若存在错误或字段缺失，必须写入对应模块，不能省略。
+
+---
+
+## Step 8) 保存报告（UTF-8）
 ```powershell
 $outFile = Join-Path $LOG_DIR ("analysis_{0}_{1}.txt" -f $SYMBOL, $meta.server_time_ms)
 $report | Set-Content -Encoding utf8 -Path $outFile
 ```
+说明：
+- 统一使用 ASCII 段落标签，保证在 PowerShell 5.1 下可读。
+- 如终端中文显示异常，不影响报告主体可审计字段（字段名与数值必须可读）。
+
+## Step 8.5) 决策守卫（必须）
+写完报告后必须执行：
+```powershell
+python $GUARD_PY --analysis $outFile --inplace
+```
+判定：
+- `status=PASS`：保持原结论。
+- `status=ENFORCED_WAIT`：守卫已将报告 `FINAL_DECISION` 强制改为 WAIT（说明原结论被拦截）。
+- `status=FAIL`：本轮中止，先修复格式/字段问题再重跑。
 
 ---
 
-## Step 9) 结束确认（输出两行后停止）
-```
+## Step 9) 结束确认（两行）
+```text
 AGENT_PATH = <当前工作目录>
 ANALYSIS_PATH = <输出文件完整路径>
 ```
 
----
 
-## 常见缺失/报错的快速判断（给你参考）
-- 如果 errors 里出现类似 `interval: "1"` 而不是 `"1m"`，并导致 400：**这是脚本参数/映射问题**（Binance kline interval 通常是 `1m/3m/5m`），不一定是你提示词的问题。  
-- 如果中文变 `????`：通常是 **PowerShell 5.1 的重定向保存** 或 **默认编码**；用 Step 0 + Step 8 的写文件方式能显著降低概率。

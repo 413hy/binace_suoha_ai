@@ -1,33 +1,78 @@
-你在 Windows PowerShell 5.1 里执行命令。不要做任何“编码识别/探测脚本”，不要打印整个 md 文档内容；直接按文档步骤执行即可。
-文档保证是 UTF-8（如显示乱码也当作“显示问题”，不要进入编码检测流程）。
+﻿你在 Windows PowerShell 5.1 里执行命令。不要做编码探测脚本，不要打印整个 md 文档内容；直接按文档步骤执行。
 
 【参数】
-SYMBOL=XRPUSDT BTCUSDT ETHUSDT
+SYMBOLS=BTCUSDT ETHUSDT SOLUSDT
 PROFILE=MED
+MODE=precision
+HORIZON=30m~1h
+POLICY=precision_v2
+REPORT_STYLE=audit_full_v1
 SKILL_FILE=SKILL.md
 DATA_PY=.\scripts\data.py
+SELF_CHECK_PY=.\scripts\self_check.py
+GUARD_PY=.\scripts\decision_guard.py
 LOG_DIR=.\logs
 
-【从现在开始严格执行】
-1) 先执行以下编码设置（逐条执行一次）：
-chcp 65001
-$OutputEncoding = New-Object System.Text.UTF8Encoding $false
-[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
-$env:PYTHONIOENCODING = "utf-8"
-$env:PYTHONUTF8 = "1"
-$PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
-$PSDefaultParameterValues['Set-Content:Encoding'] = 'utf8'
-$PSDefaultParameterValues['Add-Content:Encoding'] = 'utf8'
-if (!(Test-Path ${LOG_DIR})) { New-Item -ItemType Directory -Path ${LOG_DIR} -Force | Out-Null }
+【执行要求】
+1) 先执行 UTF-8 编码设置（chcp/OutputEncoding/PYTHONUTF8/PSDefaultParameterValues）。
+2) 将 SYMBOLS 拆分为每个 SYMBOL，按顺序执行：
+   - `$SYMBOL=<当前值>`
+   - 先跑 `python ${SELF_CHECK_PY} --symbol $SYMBOL`，若 `status=FAIL` 则先修复后再继续
+   - 用 UTF-8 读取 `.\${SKILL_FILE}`，不要打印全文
+   - `$PROFILE=${PROFILE}`
+   - `$MODE=${MODE}`
+   - `$HORIZON=${HORIZON}`
+   - `$REPORT_STYLE=${REPORT_STYLE}`
+   - 严格按 `SKILL.md` Step 0~9
+   - `data.py` 路径固定 `${DATA_PY}`
+   - 每个 SYMBOL 完成分析后必须执行：`python ${GUARD_PY} --analysis <ANALYSIS_PATH> --inplace`
+   - 输出写入 `${LOG_DIR}`
+3) 每个 SYMBOL 必须输出 Step 9 两行确认。
+4) 报告保存必须 `Set-Content/Out-File -Encoding utf8`，禁止 `>` `>>`。
+5) PowerShell 5.1 兼容：禁止 `ConvertFrom-Json -Depth` 和 `?:`。
 
-2) 不要用 type / cat 直接读文件；读取 skills 文件时必须显式 UTF-8：
-$skill = Get-Content -Raw -Encoding utf8 .\${SKILL_FILE} | Out-String
-（不要把 $skill 全文打印出来）
+【高准确度约束】
+- long/short 准度优先，允许低覆盖。
+- 若 LONG/SHORT 核心条件齐全且置信度 >= 68，不要直接 WAIT。
+- 若多周期明显冲突或 flow 明显背离才 WAIT。
+- 决策必须可审计：每个结论必须对应字段证据与判定逻辑，禁止“黑盒结论”。
+- 硬门槛（必须）：
+  - LONG_CORE 五项未全部满足 => 必须 WAIT。
+  - SHORT_CORE 五项未全部满足 => 必须 WAIT。
+  - `action=SHORT` 且 `rsi_1h<=34` 且 `ret_1h_pct>=0` => 必须 WAIT。
+  - `flow_ratio<=0.97` 且 `imbalance>=0.08`，或 `flow_ratio>=1.03` 且 `imbalance<=-0.08` => 必须 WAIT。
+  - `abs(entry-book_mid)/max(1e-9,atr15) > 0.25` => 必须 WAIT。
+- 守卫约束（必须）：
+  - `python ${GUARD_PY} --analysis <ANALYSIS_PATH> --inplace` 返回 `status=ENFORCED_WAIT` 时，最终结论必须以守卫后的 WAIT 为准。
+  - 若守卫返回 `status=FAIL`，本轮该 SYMBOL 中止并修复后重跑。
 
-3) 现在开始：打开并严格遵循 ${SKILL_FILE} 的所有步骤；把 SYMBOL 替换为上面每个 SYMBOL，把 PROFILE 替换为上面的 PROFILE，从 Step 0 开始执行。
-   - data.py 路径固定用 ${DATA_PY}
-   - snapshot / analysis 输出都写入 ${LOG_DIR}
-   - 每个 SYMBOL 都要输出 Step 9 的两行确认
-   - PowerShell 5.1 兼容：禁止使用 `ConvertFrom-Json -Depth`；禁止使用 `?:` 三元表达式
+【analysis 报告必须是完整版（audit_full_v1）】
+- 报告最少包含以下模块，且按顺序输出：
+  1) `[SNAPSHOT_META]`
+  2) `[DATA_QUALITY_GATE]`（K1~K7 每条 PASS/FAIL + 数值）
+  3) `[FEATURE_TABLE]`（lastPrice/ret_1h_pct/ret_4h_pct/spread_bps/imbalance/flow_ratio/flow_imbalance_qty/atr15）
+  4) `[MULTI_TIMEFRAME]`（5m/15m/30m/1h 的 EMA20/EMA50/RSI/方向）
+  5) `[FLOW_AND_ORDERBOOK]`（recent_count/agg_count/buy_sell_ratio/imbalance_qty/depth imbalance）
+  6) `[SCORING_BREAKDOWN]`（long_score / short_score / conflict_penalty / final_confidence）
+  7) `[DECISION_TRACE]`（LONG_CORE/SHORT_CORE 每个条件 true/false，为什么触发或未触发）
+  8) `[RISK_PLAN]`（entry_source/entry/entry_mid_diff/sl/tp1/tp2/size/leverage_cap）
+  9) `[INVALIDATION_AND_TIMEOUT]`（至少2条失效条件 + 30~60m超时退出）
+  10) `[COUNTER_SCENARIO]`（与当前相反方向何时成立）
+  11) `[FINAL_DECISION]`（action/confidence/data_quality/wait_reason_if_any）
+- 所有模块都必须包含“字段=数值”格式，不能只写自然语言。
+- 报告使用 ASCII 模块标签，避免 PowerShell 5.1 下中文乱码导致信息缺失。
+- `[DECISION_TRACE]` 必须包含 `core_complete=<true|false>` 与 `hard_blockers=[...]`。
 
-4) 输出报告保存时：必须用 Set-Content/Out-File 且 -Encoding utf8；禁止使用 > 或 >> 重定向。
+【实盘实时约束（必须）】
+- 当前执行为实时分析，不是历史回测。
+- 禁止调用 `scripts/backtest_random_nodes.py` 或任意历史时间戳回放逻辑。
+- 必须基于 `scripts/data.py` 生成的最新 snapshot 输出结论。
+
+【完成后汇总输出】
+- SYMBOL
+- action
+- confidence
+- data_quality
+- ANALYSIS_PATH
+
+

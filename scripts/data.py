@@ -1,5 +1,5 @@
 # data.py
-# Binance USDⓈ-M Futures (U本位永续) 合约数据快照抓取脚本
+# Binance.US Spot 行情快照抓取脚本
 # 依赖：标准库 + requests
 import sys
 if hasattr(sys.stdout, "reconfigure"):
@@ -17,13 +17,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 SYMBOL_DEFAULT = "DOGEUSDT"
-BASE_DEFAULT = "https://fapi.binance.com"
+BASE_DEFAULT = "https://api.binance.us"
 
-INTERVALS_DEFAULT = "5m,15m,1h,4h,1d"
-KLINE_LIMIT_DEFAULT = 240
+INTERVALS_DEFAULT = "1m,3m,5m,15m,30m,1h"
+KLINE_LIMIT_DEFAULT = 360
 
-HIST_PERIOD_DEFAULT = "1h"
-HIST_LIMIT_DEFAULT = 72
+HIST_PERIOD_DEFAULT = "15m"
+HIST_LIMIT_DEFAULT = 192
 
 DEPTH_LEVELS_DEFAULT = 50
 TRADES_LIMIT_DEFAULT = 1000
@@ -38,13 +38,9 @@ VALID_KLINE_INTERVALS = {
 }
 VALID_HIST_PERIODS = {"5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"}
 
-# ✅ USDⓈ-M 正确端点：takerlongshortRatio
-# ✅ 同时留一个历史/兼容回退（若环境里存在旧命名）
-TAKER_ENDPOINTS = [
-    "/futures/data/takerlongshortRatio",
-    "/futures/data/takerBuySellVol",
-]
-TAKER_FALLBACK_PERIODS = ["30m", "15m", "5m"]
+# Binance.US spot 不提供 futures data（taker/funding/OI 等衍生品指标）。
+TAKER_ENDPOINTS: List[str] = []
+TAKER_FALLBACK_PERIODS: List[str] = []
 
 
 def utc_now_iso() -> str:
@@ -98,7 +94,7 @@ def validate_intervals(intervals: List[str]) -> List[str]:
     if digits_only:
         raise ValueError(
             f"检测到疑似 PowerShell 参数被拆分：{digits_only}。\n"
-            f'请用 --intervals 5m 15m 1h 4h 1d 或 --intervals "5m,15m,1h,4h,1d"\n'
+            f'请用 --intervals 1m 3m 5m 15m 30m 1h 或 --intervals "1m,3m,5m,15m,30m,1h"\n'
             f"当前收到：{intervals}"
         )
 
@@ -125,7 +121,7 @@ def validate_hist_period(period: str) -> str:
 def make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
-        "User-Agent": "binance-usdm-snapshot/1.6",
+        "User-Agent": "binance-us-spot-snapshot/2.0",
         "Accept": "application/json",
     })
     return s
@@ -206,6 +202,168 @@ def record_error(errors: Dict[str, Any], key: str, err: Dict[str, Any]) -> None:
         "status_code": err.get("status_code"),
         "error": err.get("error_text"),
         "ts_utc": utc_now_iso(),
+    }
+
+
+def deep_get(obj: Any, path: str, default: Any = None) -> Any:
+    cur = obj
+    for part in path.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return default
+    return cur
+
+
+def parse_iso_utc(ts: Any) -> Optional[dt.datetime]:
+    if not isinstance(ts, str) or not ts.strip():
+        return None
+    try:
+        return dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(dt.timezone.utc)
+    except Exception:
+        return None
+
+
+def diagnose_error(err: Dict[str, Any]) -> Dict[str, Any]:
+    status = err.get("status_code")
+    path = str(err.get("path") or "")
+    msg = str(err.get("error") or "")
+    likely_cause = "unknown"
+    retryable = False
+    action = "检查网络状态与接口参数"
+
+    if status in (418, 429):
+        likely_cause = "rate_limit"
+        retryable = True
+        action = "触发限流；降低频率、减少 symbol 并重试"
+    elif status in (500, 502, 503, 504):
+        likely_cause = "exchange_server_error"
+        retryable = True
+        action = "交易所服务端波动；短暂等待后重试"
+    elif status == 404:
+        likely_cause = "endpoint_not_supported_or_not_found"
+        retryable = False
+        action = "端点不存在或当前市场不支持；检查 API 路径/市场类型"
+    elif status == 400:
+        likely_cause = "bad_request_param"
+        retryable = False
+        action = "请求参数不合法；检查 symbol/interval/windowSize/limit"
+    elif status == 403:
+        likely_cause = "forbidden_or_geo_restricted"
+        retryable = False
+        action = "访问受限；检查网络出口与 API 使用范围"
+    elif "Timeout:" in msg:
+        likely_cause = "network_timeout"
+        retryable = True
+        action = "网络超时；增大 timeout 或稍后重试"
+    elif "RequestException:" in msg:
+        likely_cause = "network_exception"
+        retryable = True
+        action = "网络异常；检查 DNS/代理/连通性后重试"
+    elif "JSON parse error" in msg:
+        likely_cause = "invalid_json_payload"
+        retryable = True
+        action = "返回体非预期 JSON；稍后重试并记录异常返回"
+
+    return {
+        "path": path,
+        "status_code": status,
+        "likely_cause": likely_cause,
+        "retryable": retryable,
+        "suggested_action": action,
+    }
+
+
+def build_error_diagnostics(errors: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if not isinstance(errors, dict):
+        return out
+    for key, err in errors.items():
+        if isinstance(err, dict):
+            out[key] = diagnose_error(err)
+    return out
+
+
+def run_spot_self_check(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    intervals = deep_get(snapshot, "meta.intervals", []) or []
+    checks: Dict[str, bool] = {}
+
+    checks["meta.server_time_ms"] = isinstance(deep_get(snapshot, "meta.server_time_ms"), int)
+    checks["market.last_price"] = safe_float(deep_get(snapshot, "market.ticker_24h.lastPrice")) is not None
+
+    bids = deep_get(snapshot, "order_book.bids", []) or []
+    asks = deep_get(snapshot, "order_book.asks", []) or []
+    checks["order_book.depth"] = (
+        isinstance(bids, list) and len(bids) > 0 and isinstance(asks, list) and len(asks) > 0
+    )
+
+    checks["order_book.spread_imbalance"] = (
+        safe_float(deep_get(snapshot, "features.order_book.spread_bps")) is not None
+        and safe_float(deep_get(snapshot, "features.order_book.imbalance")) is not None
+    )
+
+    for iv, need in (("5m", 120), ("15m", 96), ("30m", 72), ("1h", 48)):
+        if iv in intervals:
+            rows = deep_get(snapshot, f"candles.regular.{iv}", []) or []
+            checks[f"candles.{iv}"] = isinstance(rows, list) and len(rows) >= need
+
+    recent_cnt = safe_float(deep_get(snapshot, "flow.trade_features.recent_count")) or 0.0
+    agg_cnt = safe_float(deep_get(snapshot, "flow.trade_features.agg_count")) or 0.0
+    checks["flow.trade_count"] = (recent_cnt + agg_cnt) >= 80.0
+    checks["book_ticker.spread"] = safe_float(deep_get(snapshot, "features.book_ticker.spread_bps")) is not None
+    checks["ticker_window.h1_h4"] = (
+        safe_float(deep_get(snapshot, "features.ticker_window.h1.price_change_pct")) is not None
+        and safe_float(deep_get(snapshot, "features.ticker_window.h4.price_change_pct")) is not None
+    )
+    checks["avg_price"] = safe_float(deep_get(snapshot, "market.avg_price.price")) is not None
+
+    generated_at = parse_iso_utc(deep_get(snapshot, "meta.generated_at"))
+    server_time = parse_iso_utc(deep_get(snapshot, "meta.server_time"))
+    freshness_sec = None
+    if generated_at is not None and server_time is not None:
+        freshness_sec = abs((generated_at - server_time).total_seconds())
+    checks["freshness<=20m"] = freshness_sec is not None and freshness_sec <= 20 * 60
+
+    critical = [
+        "meta.server_time_ms",
+        "market.last_price",
+        "order_book.depth",
+        "order_book.spread_imbalance",
+        "flow.trade_count",
+        "ticker_window.h1_h4",
+        "freshness<=20m",
+    ]
+    if "5m" in intervals:
+        critical.append("candles.5m")
+    if "15m" in intervals:
+        critical.append("candles.15m")
+    if "30m" in intervals:
+        critical.append("candles.30m")
+    elif "1h" in intervals:
+        critical.append("candles.1h")
+
+    failed = [k for k, ok in checks.items() if not ok]
+    failed_critical = [k for k in critical if not checks.get(k, False)]
+    failed_non_critical = [k for k in failed if k not in failed_critical]
+
+    errors = snapshot.get("errors", {}) if isinstance(snapshot, dict) else {}
+    errors_count = len(errors) if isinstance(errors, dict) else 0
+
+    status = "PASS"
+    if failed_critical:
+        status = "FAIL"
+    elif failed_non_critical or errors_count > 0:
+        status = "WARN"
+
+    return {
+        "status": status,
+        "checked_at_utc": utc_now_iso(),
+        "errors_count": errors_count,
+        "freshness_sec": freshness_sec,
+        "checks": checks,
+        "failed": failed,
+        "failed_critical": failed_critical,
+        "failed_non_critical": failed_non_critical,
     }
 
 
@@ -317,7 +475,15 @@ def order_book_features(bids: List[List[Any]], asks: List[List[Any]]) -> Dict[st
 
 
 def pick_base_interval(intervals: List[str]) -> str:
-    return "1h" if "1h" in intervals else intervals[0]
+    for iv in ("15m", "30m", "5m", "1h", "3m", "1m"):
+        if iv in intervals:
+            return iv
+    return intervals[0]
+
+
+def is_binance_us_spot(base_url: str) -> bool:
+    host = (base_url or "").lower()
+    return "api.binance.us" in host
 
 
 def load_exchange_info_cache(cache_path: str, max_age_sec: int = 86400) -> Optional[Dict[str, Any]]:
@@ -371,6 +537,184 @@ def compute_candle_features(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def to_pct(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    if a is None or b is None or b == 0:
+        return None
+    return (a - b) / b * 100.0
+
+
+def ticker_window_features(ticker: Any) -> Dict[str, Optional[float]]:
+    if not isinstance(ticker, dict):
+        return {
+            "last_price": None,
+            "open_price": None,
+            "high_price": None,
+            "low_price": None,
+            "quote_volume": None,
+            "price_change_pct": None,
+            "range_pct": None,
+        }
+    last_price = safe_float(ticker.get("lastPrice"))
+    open_price = safe_float(ticker.get("openPrice"))
+    high_price = safe_float(ticker.get("highPrice"))
+    low_price = safe_float(ticker.get("lowPrice"))
+    quote_volume = safe_float(ticker.get("quoteVolume"))
+    pcp = safe_float(ticker.get("priceChangePercent"))
+    range_pct = to_pct(high_price, open_price) if high_price is not None and open_price is not None else None
+    if range_pct is not None and low_price is not None and open_price not in (None, 0):
+        lo = to_pct(low_price, open_price)
+        if lo is not None:
+            range_pct = range_pct - lo
+    return {
+        "last_price": last_price,
+        "open_price": open_price,
+        "high_price": high_price,
+        "low_price": low_price,
+        "quote_volume": quote_volume,
+        "price_change_pct": pcp,
+        "range_pct": range_pct,
+    }
+
+
+def parse_spot_trades(rows: Any) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if not isinstance(rows, list):
+        return out
+    for it in rows:
+        if not isinstance(it, dict):
+            continue
+        ts = it.get("time")
+        try:
+            ts = int(ts) if ts is not None else None
+        except Exception:
+            ts = None
+        out.append({
+            "id": it.get("id"),
+            "price": safe_float(it.get("price")),
+            "qty": safe_float(it.get("qty")),
+            "quoteQty": safe_float(it.get("quoteQty")),
+            "time_ms": ts,
+            "time": ms_to_iso_utc(ts) if isinstance(ts, int) else None,
+            "isBuyerMaker": bool(it.get("isBuyerMaker")) if "isBuyerMaker" in it else None,
+            "isBestMatch": bool(it.get("isBestMatch")) if "isBestMatch" in it else None,
+        })
+    return out
+
+
+def parse_agg_trades(rows: Any) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if not isinstance(rows, list):
+        return out
+    for it in rows:
+        if not isinstance(it, dict):
+            continue
+        ts = it.get("T")
+        try:
+            ts = int(ts) if ts is not None else None
+        except Exception:
+            ts = None
+        out.append({
+            "a": it.get("a"),
+            "price": safe_float(it.get("p")),
+            "qty": safe_float(it.get("q")),
+            "time_ms": ts,
+            "time": ms_to_iso_utc(ts) if isinstance(ts, int) else None,
+            "m": bool(it.get("m")) if "m" in it else None,
+        })
+    return out
+
+
+def trade_flow_features(recent: List[Dict[str, Any]], agg: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
+    buy_qty = 0.0
+    sell_qty = 0.0
+    buy_notional = 0.0
+    sell_notional = 0.0
+    recent_cnt = 0
+    agg_cnt = 0
+    last_ts = None
+
+    for t in recent:
+        q = safe_float(t.get("qty"))
+        p = safe_float(t.get("price"))
+        is_bm = t.get("isBuyerMaker")
+        if q is None or p is None or is_bm is None:
+            continue
+        recent_cnt += 1
+        n = q * p
+        # isBuyerMaker=True => seller aggressor; False => buyer aggressor
+        if is_bm:
+            sell_qty += q
+            sell_notional += n
+        else:
+            buy_qty += q
+            buy_notional += n
+        ts = t.get("time_ms")
+        if isinstance(ts, int) and (last_ts is None or ts > last_ts):
+            last_ts = ts
+
+    for t in agg:
+        q = safe_float(t.get("qty"))
+        p = safe_float(t.get("price"))
+        m = t.get("m")
+        if q is None or p is None or m is None:
+            continue
+        agg_cnt += 1
+        n = q * p
+        if m:
+            sell_qty += q
+            sell_notional += n
+        else:
+            buy_qty += q
+            buy_notional += n
+        ts = t.get("time_ms")
+        if isinstance(ts, int) and (last_ts is None or ts > last_ts):
+            last_ts = ts
+
+    denom_qty = buy_qty + sell_qty
+    denom_notional = buy_notional + sell_notional
+    bs_ratio = (buy_qty / sell_qty) if sell_qty > 0 else (None if buy_qty == 0 else 99.0)
+    imbalance_qty = ((buy_qty - sell_qty) / denom_qty) if denom_qty > 0 else None
+    imbalance_notional = ((buy_notional - sell_notional) / denom_notional) if denom_notional > 0 else None
+
+    return {
+        "recent_count": float(recent_cnt),
+        "agg_count": float(agg_cnt),
+        "buy_qty": buy_qty if denom_qty > 0 else None,
+        "sell_qty": sell_qty if denom_qty > 0 else None,
+        "buy_notional": buy_notional if denom_notional > 0 else None,
+        "sell_notional": sell_notional if denom_notional > 0 else None,
+        "buy_sell_ratio": bs_ratio,
+        "imbalance_qty": imbalance_qty,
+        "imbalance_notional": imbalance_notional,
+        "last_trade_time_ms": float(last_ts) if isinstance(last_ts, int) else None,
+        "last_trade_time": ms_to_iso_utc(last_ts) if isinstance(last_ts, int) else None,
+    }
+
+
+def book_ticker_features(book_ticker: Any) -> Dict[str, Optional[float]]:
+    if not isinstance(book_ticker, dict):
+        return {"bidPrice": None, "askPrice": None, "bidQty": None, "askQty": None, "spread_bps": None, "imbalance_top": None}
+    bid_p = safe_float(book_ticker.get("bidPrice"))
+    ask_p = safe_float(book_ticker.get("askPrice"))
+    bid_q = safe_float(book_ticker.get("bidQty"))
+    ask_q = safe_float(book_ticker.get("askQty"))
+    spread_bps = None
+    if bid_p is not None and ask_p is not None and bid_p > 0 and ask_p > 0:
+        mid = (bid_p + ask_p) / 2.0
+        if mid > 0:
+            spread_bps = ((ask_p - bid_p) / mid) * 10000.0
+    denom = (bid_q or 0.0) + (ask_q or 0.0)
+    imb = ((bid_q - ask_q) / denom) if denom > 0 else None
+    return {
+        "bidPrice": bid_p,
+        "askPrice": ask_p,
+        "bidQty": bid_q,
+        "askQty": ask_q,
+        "spread_bps": spread_bps,
+        "imbalance_top": imb,
+    }
+
+
 def build_agent_pack(snapshot: Dict[str, Any], json_path: str, agent_path: str) -> str:
     meta = snapshot.get("meta", {}) or {}
     errors = snapshot.get("errors", {}) or {}
@@ -395,11 +739,27 @@ def build_agent_pack(snapshot: Dict[str, Any], json_path: str, agent_path: str) 
     intervals = meta.get("intervals", [])
     base_iv = get("features.base_interval")
     by_iv = get("features.by_interval", {}) or {}
-    f_15m = by_iv.get("15m", {}) if isinstance(by_iv, dict) else {}
+    by_iv = by_iv if isinstance(by_iv, dict) else {}
+    f_5m = by_iv.get("5m", {})
+    f_15m = by_iv.get("15m", {})
+    f_30m = by_iv.get("30m", {})
+    f_1h = by_iv.get("1h", {})
 
     key_metrics = {
         "markPrice": safe_float(get("market.premium_index.markPrice")),
         "lastPrice": safe_float(get("market.ticker_24h.lastPrice")),
+        "book_bid": safe_float(get("market.book_ticker.bidPrice")),
+        "book_ask": safe_float(get("market.book_ticker.askPrice")),
+        "book_spread_bps": safe_float(get("features.book_ticker.spread_bps")),
+        "avg_price_5m": safe_float(get("market.avg_price.price")),
+        "ret_1h_pct": safe_float(get("features.ticker_window.h1.price_change_pct")),
+        "ret_4h_pct": safe_float(get("features.ticker_window.h4.price_change_pct")),
+        "range_1h_pct": safe_float(get("features.ticker_window.h1.range_pct")),
+        "range_4h_pct": safe_float(get("features.ticker_window.h4.range_pct")),
+        "trade_recent_count": safe_float(get("flow.trade_features.recent_count")),
+        "trade_agg_count": safe_float(get("flow.trade_features.agg_count")),
+        "trade_buy_sell_ratio": safe_float(get("flow.trade_features.buy_sell_ratio")),
+        "trade_imbalance_qty": safe_float(get("flow.trade_features.imbalance_qty")),
         "base_interval": base_iv,
         "last_close": get("features.last_close"),
         "ret_1_candle_pct": get("features.ret_1_candle_pct"),
@@ -413,47 +773,117 @@ def build_agent_pack(snapshot: Dict[str, Any], json_path: str, agent_path: str) 
         "spread_bps": get("features.order_book.spread_bps"),
         "imbalance": get("features.order_book.imbalance"),
 
+        "rsi14_5m_last": f_5m.get("rsi14_last"),
+        "atr14_5m_last": f_5m.get("atr14_last"),
+        "ema20_5m_last": f_5m.get("ema20_last"),
+        "ema50_5m_last": f_5m.get("ema50_last"),
+        "ret_1_candle_5m_pct": f_5m.get("ret_1_candle_pct"),
+
         "rsi14_15m_last": f_15m.get("rsi14_last"),
         "atr14_15m_last": f_15m.get("atr14_last"),
         "ema20_15m_last": f_15m.get("ema20_last"),
         "ema50_15m_last": f_15m.get("ema50_last"),
         "ret_1_candle_15m_pct": f_15m.get("ret_1_candle_pct"),
+
+        "rsi14_30m_last": f_30m.get("rsi14_last"),
+        "atr14_30m_last": f_30m.get("atr14_last"),
+        "ema20_30m_last": f_30m.get("ema20_last"),
+        "ema50_30m_last": f_30m.get("ema50_last"),
+        "ret_1_candle_30m_pct": f_30m.get("ret_1_candle_pct"),
+
+        "rsi14_1h_last": f_1h.get("rsi14_last"),
+        "atr14_1h_last": f_1h.get("atr14_last"),
+        "ema20_1h_last": f_1h.get("ema20_last"),
+        "ema50_1h_last": f_1h.get("ema50_last"),
+        "ret_1_candle_1h_pct": f_1h.get("ret_1_candle_pct"),
     }
 
     def L(path: str) -> int:
         v = get(path, [])
         return len(v) if isinstance(v, list) else 0
 
+    market_type = str(meta.get("market_type") or "").lower()
+    is_spot = market_type == "spot"
+
     K = {}
     prem = get("market.premium_index", {}) or {}
-    K["K1_premiumIndex"] = isinstance(prem, dict) and (("markPrice" in prem) or ("lastFundingRate" in prem))
-    K["K2_lastPrice"] = get("market.ticker_24h.lastPrice") is not None
+    if is_spot:
+        K["K1_price"] = (get("market.ticker_24h.lastPrice") is not None) or (get("market.premium_index.markPrice") is not None)
+    else:
+        K["K1_premiumIndex"] = isinstance(prem, dict) and (("markPrice" in prem) or ("lastFundingRate" in prem))
+        K["K2_lastPrice"] = get("market.ticker_24h.lastPrice") is not None
     bids = get("order_book.bids", []) or []
     asks = get("order_book.asks", []) or []
     K["K3_orderbook"] = (isinstance(bids, list) and len(bids) > 0 and isinstance(asks, list) and len(asks) > 0
                          and get("features.order_book.spread_bps") is not None and get("features.order_book.imbalance") is not None)
-    K["K4_candles_15m"] = (L("candles.regular.15m") >= 80)
-    K["K5_candles_1h"] = (L("candles.regular.1h") >= 48)
-    K["K6_mark_1h"] = (L("candles.mark.1h") >= 48)
-    oi_cur = get("open_interest.current", {}) or {}
-    K["K7_open_interest"] = (isinstance(oi_cur, dict) and len(oi_cur) > 0) or (get("open_interest.change_from_prev_pct") is not None)
+    has_5m = "5m" in intervals
+    has_15m = "15m" in intervals
+    has_30m = "30m" in intervals
+    has_1h = "1h" in intervals
+
+    K["K4_candles_5m"] = (not has_5m) or (L("candles.regular.5m") >= 120)
+    K["K5_candles_15m"] = (not has_15m) or (L("candles.regular.15m") >= 96)
+    if has_30m:
+        K["K6_context_30m_or_1h"] = (L("candles.regular.30m") >= 72)
+    elif has_1h:
+        K["K6_context_30m_or_1h"] = (L("candles.regular.1h") >= 48)
+    else:
+        K["K6_context_30m_or_1h"] = True
+
+    if is_spot:
+        K["K7_mark_context"] = True
+    elif has_15m:
+        K["K7_mark_context"] = (L("candles.mark.15m") >= 96)
+    elif has_30m:
+        K["K7_mark_context"] = (L("candles.mark.30m") >= 72)
+    elif has_1h:
+        K["K7_mark_context"] = (L("candles.mark.1h") >= 48)
+    else:
+        K["K7_mark_context"] = True
+    if is_spot:
+        recent_cnt = safe_float(get("flow.trade_features.recent_count")) or 0.0
+        agg_cnt = safe_float(get("flow.trade_features.agg_count")) or 0.0
+        K["K8_trade_flow"] = (recent_cnt + agg_cnt) >= 80
+        K["K9_book_ticker"] = get("features.book_ticker.spread_bps") is not None
+        K["K10_ticker_window"] = (get("features.ticker_window.h1.price_change_pct") is not None) and (
+            get("features.ticker_window.h4.price_change_pct") is not None
+        )
+        K["K11_avg_price"] = get("market.avg_price.price") is not None
+    else:
+        oi_cur = get("open_interest.current", {}) or {}
+        K["K8_open_interest"] = (isinstance(oi_cur, dict) and len(oi_cur) > 0) or (get("open_interest.change_from_prev_pct") is not None)
 
     hist_limit = meta.get("hist_limit", 72) or 72
-    need = 24 if hist_limit >= 24 else max(8, int(hist_limit))
-    K["K8_taker_vol"] = (L("flow.taker_buy_sell_volume") >= need)
-
-    K["K9_longshort"] = (L("sentiment.global_long_short_account_ratio") >= 24)
+    need_funding = 80 if hist_limit >= 80 else max(24, int(hist_limit))
+    need_taker = 48 if hist_limit >= 48 else max(12, int(hist_limit))
+    need_sentiment = 48 if hist_limit >= 48 else max(12, int(hist_limit))
+    if not is_spot:
+        K["K9_funding_hist"] = (L("funding.history") >= need_funding)
+        K["K10_taker_vol"] = (L("flow.taker_buy_sell_volume") >= need_taker)
+        K["K11_longshort"] = (L("sentiment.global_long_short_account_ratio") >= need_sentiment)
 
     missing = [k for k, v in K.items() if not v]
     missing_n = len(missing)
     errors_count = len(errors) if isinstance(errors, dict) else 0
+    self_check = get("diagnostics.self_check", {}) or {}
+    self_check_status = str(self_check.get("status") or "UNKNOWN")
+    self_check_failed_critical = self_check.get("failed_critical", [])
+    self_check_failed = self_check.get("failed", [])
 
-    if missing_n >= 4:
-        dq = "LOW"
-    elif 2 <= missing_n <= 3:
-        dq = "MED"
+    if is_spot:
+        if missing_n >= 5:
+            dq = "LOW"
+        elif 3 <= missing_n <= 4:
+            dq = "MED"
+        else:
+            dq = "HIGH" if errors_count == 0 else "MED"
     else:
-        dq = "HIGH" if errors_count == 0 else "MED"
+        if missing_n >= 4:
+            dq = "LOW"
+        elif 2 <= missing_n <= 3:
+            dq = "MED"
+        else:
+            dq = "HIGH" if errors_count == 0 else "MED"
 
     def pick_candles(path: str, n: int):
         arr = get(path, []) or []
@@ -468,8 +898,10 @@ def build_agent_pack(snapshot: Dict[str, Any], json_path: str, agent_path: str) 
                         "l": c.get("low"), "c": c.get("close"), "v": c.get("volume")})
         return out
 
-    c15 = pick_candles("candles.regular.15m", 40)
-    c1h = pick_candles("candles.regular.1h", 80)
+    c5 = pick_candles("candles.regular.5m", 120)
+    c15 = pick_candles("candles.regular.15m", 96)
+    c30 = pick_candles("candles.regular.30m", 72)
+    c1h = pick_candles("candles.regular.1h", 48)
     ob_top = {"bids_top20": bids[:20] if isinstance(bids, list) else [],
               "asks_top20": asks[:20] if isinstance(asks, list) else []}
 
@@ -486,6 +918,9 @@ def build_agent_pack(snapshot: Dict[str, Any], json_path: str, agent_path: str) 
     lines.append("")
     lines.append(f"data_quality={dq}")
     lines.append(f"errors_count={errors_count}")
+    lines.append(f"self_check_status={self_check_status}")
+    lines.append(f"self_check_failed_critical={self_check_failed_critical}")
+    lines.append(f"self_check_failed={self_check_failed}")
     lines.append(f"missing_modules={missing}")
     lines.append("")
     lines.append("[KEY_METRICS]")
@@ -503,10 +938,16 @@ def build_agent_pack(snapshot: Dict[str, Any], json_path: str, agent_path: str) 
     else:
         lines.append("(none)")
     lines.append("")
-    lines.append("[CANDLES_REGULAR_15M_LAST40]")
+    lines.append("[CANDLES_REGULAR_5M_LAST120]")
+    lines.append(json.dumps(c5, ensure_ascii=False))
+    lines.append("")
+    lines.append("[CANDLES_REGULAR_15M_LAST96]")
     lines.append(json.dumps(c15, ensure_ascii=False))
     lines.append("")
-    lines.append("[CANDLES_REGULAR_1H_LAST80]")
+    lines.append("[CANDLES_REGULAR_30M_LAST72]")
+    lines.append(json.dumps(c30, ensure_ascii=False))
+    lines.append("")
+    lines.append("[CANDLES_REGULAR_1H_LAST48]")
     lines.append(json.dumps(c1h, ensure_ascii=False))
     lines.append("")
     lines.append("[ORDER_BOOK_TOP20]")
@@ -520,12 +961,15 @@ def build_summary_txt(snapshot: Dict[str, Any], json_path: str, agent_path: str)
     meta = snapshot.get("meta", {}) or {}
     feats = snapshot.get("features", {}) or {}
     err_cnt = len(snapshot.get("errors") or {})
+    self_check = deep_get(snapshot, "diagnostics.self_check", {}) or {}
     lines = []
     lines.append("【给分析Agent的摘要】")
     lines.append(f"- symbol: {meta.get('symbol')}")
     lines.append(f"- server_time_utc: {meta.get('server_time')} ({meta.get('server_time_ms')})")
     lines.append(f"- generated_at_utc: {meta.get('generated_at')}")
     lines.append(f"- errors_count: {err_cnt}")
+    lines.append(f"- self_check_status: {self_check.get('status')}")
+    lines.append(f"- self_check_failed_critical: {self_check.get('failed_critical')}")
     lines.append("")
     lines.append("【关键特征】")
     lines.append(f"- base_interval: {feats.get('base_interval')}")
@@ -535,11 +979,21 @@ def build_summary_txt(snapshot: Dict[str, Any], json_path: str, agent_path: str)
     lines.append(f"- atr14_last: {feats.get('atr14_last')}")
     lines.append(f"- ema20_last: {feats.get('ema20_last')}")
     lines.append(f"- ema50_last: {feats.get('ema50_last')}")
-    lines.append(f"- funding_rate: {snapshot.get('funding', {}).get('current_rate')}")
-    lines.append(f"- funding_annualized_pct: {snapshot.get('funding', {}).get('annualized_pct')}")
-    lines.append(f"- oi_change_from_prev_pct: {snapshot.get('open_interest', {}).get('change_from_prev_pct')}")
     lines.append(f"- spread_bps: {feats.get('order_book', {}).get('spread_bps')}")
     lines.append(f"- imbalance: {feats.get('order_book', {}).get('imbalance')}")
+    lines.append(f"- book_spread_bps: {feats.get('book_ticker', {}).get('spread_bps')}")
+    lines.append(f"- trade_buy_sell_ratio: {feats.get('trade_flow', {}).get('buy_sell_ratio')}")
+    lines.append(f"- trade_imbalance_qty: {feats.get('trade_flow', {}).get('imbalance_qty')}")
+    lines.append(f"- ret_1h_pct: {feats.get('ticker_window', {}).get('h1', {}).get('price_change_pct')}")
+    lines.append(f"- ret_4h_pct: {feats.get('ticker_window', {}).get('h4', {}).get('price_change_pct')}")
+    by_iv = feats.get("by_interval", {}) if isinstance(feats.get("by_interval"), dict) else {}
+    for iv in ("5m", "15m", "30m", "1h"):
+        ivf = by_iv.get(iv, {}) if isinstance(by_iv.get(iv), dict) else {}
+        if ivf:
+            lines.append(
+                f"- {iv}_view: ret_1={ivf.get('ret_1_candle_pct')} rsi14={ivf.get('rsi14_last')} "
+                f"ema20={ivf.get('ema20_last')} ema50={ivf.get('ema50_last')}"
+            )
     lines.append("")
     lines.append(f"JSON_FILE: {os.path.abspath(json_path)}")
     lines.append(f"AGENT_PACK: {os.path.abspath(agent_path)}")
@@ -547,15 +1001,15 @@ def build_summary_txt(snapshot: Dict[str, Any], json_path: str, agent_path: str)
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Binance USDⓈ-M Futures snapshot fetcher (public endpoints)")
+    ap = argparse.ArgumentParser(description="Binance.US spot snapshot fetcher (public endpoints)")
     ap.add_argument("--symbol", default=SYMBOL_DEFAULT, help="交易对，例如 DOGEUSDT")
-    ap.add_argument("--base", default=BASE_DEFAULT, help="base url，默认 https://fapi.binance.com")
+    ap.add_argument("--base", default=BASE_DEFAULT, help="base url，默认 https://api.binance.us")
 
     ap.add_argument(
         "--intervals",
         nargs="+",
         default=[INTERVALS_DEFAULT],
-        help='K线 interval 列表：--intervals 5m 15m 1h 或 --intervals "5m,15m,1h"'
+        help='K线 interval 列表：--intervals 1m 3m 5m 15m 30m 1h 或 --intervals "1m,3m,5m,15m,30m,1h"'
     )
     ap.add_argument("--kline-limit", type=int, default=KLINE_LIMIT_DEFAULT)
     ap.add_argument("--hist-period", default=HIST_PERIOD_DEFAULT)
@@ -593,6 +1047,21 @@ def main() -> int:
     trades_limit = clamp_int(int(args.trades_limit), 1, 1000)
 
     base_interval = pick_base_interval(intervals)
+    use_binance_us_spot = is_binance_us_spot(base_url)
+    if not use_binance_us_spot:
+        print("ERROR: 当前版本仅支持 Binance.US API，请使用 --base https://api.binance.us", file=sys.stderr)
+        return 2
+
+    path_time = "/api/v3/time"
+    path_ticker_24h = "/api/v3/ticker/24hr"
+    path_ticker_window = "/api/v3/ticker"
+    path_book_ticker = "/api/v3/ticker/bookTicker"
+    path_avg_price = "/api/v3/avgPrice"
+    path_depth = "/api/v3/depth"
+    path_klines_regular = "/api/v3/klines"
+    path_recent_trades = "/api/v3/trades"
+    path_agg_trades = "/api/v3/aggTrades"
+    path_exchange_info = "/api/v3/exchangeInfo"
 
     session = make_session()
     errors: Dict[str, Any] = {}
@@ -610,10 +1079,7 @@ def main() -> int:
 
     def fetch_taker_with_endpoint_fallback(period: str, limit: int, expected_min_points: int) -> Optional[List[Dict[str, Any]]]:
         """
-        ✅ 先试 USDⓈ-M 正确端点 /takerlongshortRatio
-        ✅ 若 404 再试旧端点 /takerBuySellVol
-        ✅ 若成功，不把前面的 404 计入 errors（避免影响置信度门槛）
-        并做 period fallback（点数不足 -> 尝试更细 period）
+        兼容保留：Binance.US spot 无 taker ratio，当前版本默认不调用本函数。
         """
         used_path = None
         used_period = period
@@ -699,7 +1165,7 @@ def main() -> int:
 
     # /time
     server_time_ms = None
-    t = fetch("time", "/fapi/v1/time")
+    t = fetch("time", path_time)
     if isinstance(t, dict) and "serverTime" in t:
         try:
             server_time_ms = int(t["serverTime"])
@@ -718,14 +1184,17 @@ def main() -> int:
     out_txt = base_no_ext + ".txt"
     agent_txt = base_no_ext + "_agent.txt"
 
-    ticker_24h = fetch("ticker_24h", "/fapi/v1/ticker/24hr", {"symbol": symbol}, critical=True)
-    premium_index = fetch("premium_index", "/fapi/v1/premiumIndex", {"symbol": symbol}, critical=True)
-    open_interest_cur = fetch("open_interest_current", "/fapi/v1/openInterest", {"symbol": symbol}, critical=True)
+    ticker_24h = fetch("ticker_24h", path_ticker_24h, {"symbol": symbol}, critical=True)
+    ticker_1h = fetch("ticker_1h", path_ticker_window, {"symbol": symbol, "windowSize": "1h"})
+    ticker_4h = fetch("ticker_4h", path_ticker_window, {"symbol": symbol, "windowSize": "4h"})
+    book_ticker = fetch("book_ticker", path_book_ticker, {"symbol": symbol}, critical=True)
+    avg_price = fetch("avg_price", path_avg_price, {"symbol": symbol})
+    premium_index = {}
+    open_interest_cur = {}
+    funding_hist: Any = []
 
-    funding_limit = clamp_int(max(200, min(1000, hist_limit * 20)), 200, 1000)
-    funding_hist = fetch("funding_rate_history", "/fapi/v1/fundingRate", {"symbol": symbol, "limit": funding_limit})
-
-    depth_raw = fetch("depth", "/fapi/v1/depth", {"symbol": symbol, "limit": 1000}, critical=True)
+    depth_req_limit = clamp_int(depth_levels, 5, 5000)
+    depth_raw = fetch("depth", path_depth, {"symbol": symbol, "limit": depth_req_limit}, critical=True)
 
     candles_regular: Dict[str, List[Dict[str, Any]]] = {}
     candles_mark: Dict[str, List[Dict[str, Any]]] = {}
@@ -733,63 +1202,43 @@ def main() -> int:
     candles_premium: Dict[str, List[Dict[str, Any]]] = {}
 
     for iv in intervals:
-        raw = fetch(f"klines_regular_{iv}", "/fapi/v1/klines", {"symbol": symbol, "interval": iv, "limit": kline_limit},
+        raw = fetch(f"klines_regular_{iv}", path_klines_regular, {"symbol": symbol, "interval": iv, "limit": kline_limit},
                     critical=(iv == base_interval))
         candles_regular[iv] = parse_kline_rows(raw) if raw is not None else []
 
-        raw = fetch(f"klines_mark_{iv}", "/fapi/v1/markPriceKlines", {"symbol": symbol, "interval": iv, "limit": kline_limit},
-                    critical=(iv == base_interval))
-        candles_mark[iv] = parse_kline_rows(raw) if raw is not None else []
-
-        # ✅ indexPriceKlines 必须用 pair
-        raw = fetch(f"klines_index_{iv}", "/fapi/v1/indexPriceKlines", {"pair": symbol, "interval": iv, "limit": kline_limit})
-        candles_index[iv] = parse_kline_rows(raw) if raw is not None else []
-
-        raw = fetch(f"klines_premium_{iv}", "/fapi/v1/premiumIndexKlines", {"symbol": symbol, "interval": iv, "limit": kline_limit})
-        candles_premium[iv] = parse_kline_rows(raw) if raw is not None else []
+        candles_mark[iv] = []
+        candles_index[iv] = []
+        candles_premium[iv] = []
 
     if not candles_regular.get(base_interval):
         critical_failures.append(f"klines_regular_{base_interval}(empty)")
-    if not candles_mark.get(base_interval):
-        critical_failures.append(f"klines_mark_{base_interval}(empty)")
+    oi_hist = []
+    global_ls = []
+    top_ls_acc = []
+    top_ls_pos = []
+    taker_bsv_norm = []
+    basis = []
 
-    oi_hist = fetch("open_interest_hist", "/futures/data/openInterestHist", {"symbol": symbol, "period": hist_period, "limit": hist_limit})
-    global_ls = fetch("global_long_short_account_ratio", "/futures/data/globalLongShortAccountRatio",
-                      {"symbol": symbol, "period": hist_period, "limit": hist_limit})
-    top_ls_acc = fetch("top_long_short_account_ratio", "/futures/data/topLongShortAccountRatio",
-                       {"symbol": symbol, "period": hist_period, "limit": hist_limit})
-    top_ls_pos = fetch("top_long_short_position_ratio", "/futures/data/topLongShortPositionRatio",
-                       {"symbol": symbol, "period": hist_period, "limit": hist_limit})
+    flow_limit = clamp_int(trades_limit, 50, 1000)
+    raw_recent_trades = fetch("recent_trades", path_recent_trades, {"symbol": symbol, "limit": flow_limit})
+    raw_agg_trades = fetch("agg_trades", path_agg_trades, {"symbol": symbol, "limit": flow_limit})
 
-    expected_min = 24 if hist_limit >= 24 else max(8, hist_limit)
-    taker_bsv_norm = fetch_taker_with_endpoint_fallback(hist_period, hist_limit, expected_min)
+    recent_trades_out = parse_spot_trades(raw_recent_trades)
+    agg_trades_out = parse_agg_trades(raw_agg_trades)
+    trade_flow_out = trade_flow_features(recent_trades_out, agg_trades_out)
 
-    basis = fetch("basis", "/futures/data/basis",
-                  {"pair": symbol, "contractType": "PERPETUAL", "period": hist_period, "limit": hist_limit})
-
-    trades_out: List[Dict[str, Any]] = []
+    trades_out: Any = []
     if args.include_trades:
-        raw_trades = fetch("agg_trades", "/fapi/v1/aggTrades", {"symbol": symbol, "limit": clamp_int(trades_limit, 1, 1000)})
-        if isinstance(raw_trades, list):
-            for it in raw_trades:
-                if not isinstance(it, dict):
-                    continue
-                trades_out.append({
-                    "a": it.get("a"),
-                    "p": safe_float(it.get("p")),
-                    "q": safe_float(it.get("q")),
-                    "T": it.get("T"),
-                    "m": it.get("m"),
-                })
+        trades_out = {"recent": recent_trades_out, "agg": agg_trades_out}
 
     exchange_info_out: Any = {}
     if args.include_exchange_info:
-        cache_path = os.path.join(os.path.dirname(out_json) or ".", "exchangeInfo_cache_usdm.json")
+        cache_path = os.path.join(os.path.dirname(out_json) or ".", "exchangeInfo_cache_binance_us_spot.json")
         cached = load_exchange_info_cache(cache_path, 86400)
         if cached is not None:
             exchange_info_out = cached
         else:
-            ex = fetch("exchange_info", "/fapi/v1/exchangeInfo")
+            ex = fetch("exchange_info", path_exchange_info)
             if ex is not None:
                 exchange_info_out = ex
                 save_exchange_info_cache(cache_path, ex)
@@ -836,14 +1285,38 @@ def main() -> int:
         order_book_out["asks"] = asks_s
         order_book_out["features"] = order_book_features(bids_s, asks_s)
 
+    book_ticker_out = book_ticker if isinstance(book_ticker, dict) else {}
+    book_ticker_feat = book_ticker_features(book_ticker_out)
+
+    depth_feat = order_book_out.get("features") or {}
+    merged_spread_bps = depth_feat.get("spread_bps")
+    merged_imbalance = depth_feat.get("imbalance")
+    if merged_spread_bps is None:
+        merged_spread_bps = book_ticker_feat.get("spread_bps")
+    if merged_imbalance is None:
+        merged_imbalance = book_ticker_feat.get("imbalance_top")
+
+    ticker_1h_feat = ticker_window_features(ticker_1h)
+    ticker_4h_feat = ticker_window_features(ticker_4h)
+
     base_c = candles_regular.get(base_interval, [])
     f_base = compute_candle_features(base_c)
-    c_15m = candles_regular.get("15m", [])
-    f_15m = compute_candle_features(c_15m) if c_15m else {}
+    features_by_interval: Dict[str, Dict[str, Any]] = {}
+    for iv in ("1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d"):
+        c_iv = candles_regular.get(iv, [])
+        if c_iv:
+            features_by_interval[iv] = compute_candle_features(c_iv)
+    if base_interval not in features_by_interval:
+        features_by_interval[base_interval] = f_base
+
+    market_type = "spot"
+    source_name = "binance_us_spot"
 
     snapshot: Dict[str, Any] = {
         "meta": {
-            "source": "binance_usdm_futures",
+            "source": source_name,
+            "schema_version": "binance_us_spot_snapshot_v2_1",
+            "market_type": market_type,
             "base_url": base_url,
             "symbol": symbol,
             "generated_at": utc_now_iso(),
@@ -858,6 +1331,10 @@ def main() -> int:
         "errors": errors,
         "market": {
             "ticker_24h": ticker_24h if isinstance(ticker_24h, dict) else {},
+            "ticker_1h": ticker_1h if isinstance(ticker_1h, dict) else {},
+            "ticker_4h": ticker_4h if isinstance(ticker_4h, dict) else {},
+            "book_ticker": book_ticker_out,
+            "avg_price": avg_price if isinstance(avg_price, dict) else {},
             "premium_index": premium_index if isinstance(premium_index, dict) else {},
         },
         "funding": {
@@ -877,7 +1354,12 @@ def main() -> int:
             "top_long_short_account_ratio": top_ls_acc if isinstance(top_ls_acc, list) else [],
             "top_long_short_position_ratio": top_ls_pos if isinstance(top_ls_pos, list) else [],
         },
-        "flow": {"taker_buy_sell_volume": taker_bsv_norm if isinstance(taker_bsv_norm, list) else []},
+        "flow": {
+            "taker_buy_sell_volume": taker_bsv_norm if isinstance(taker_bsv_norm, list) else [],
+            "recent_trades": recent_trades_out,
+            "agg_trades": agg_trades_out,
+            "trade_features": trade_flow_out,
+        },
         "basis": basis if isinstance(basis, list) else [],
         "order_book": order_book_out,
         "candles": {
@@ -898,14 +1380,25 @@ def main() -> int:
             "funding_rate": funding_rate,
             "funding_annualized_pct": funding_annualized_pct,
             "order_book": {
-                "spread_bps": (order_book_out.get("features") or {}).get("spread_bps"),
-                "imbalance": (order_book_out.get("features") or {}).get("imbalance"),
+                "spread_bps": merged_spread_bps,
+                "imbalance": merged_imbalance,
             },
-            "by_interval": {base_interval: f_base, "15m": f_15m},
+            "book_ticker": book_ticker_feat,
+            "trade_flow": trade_flow_out,
+            "ticker_window": {
+                "h1": ticker_1h_feat,
+                "h4": ticker_4h_feat,
+            },
+            "by_interval": features_by_interval,
         },
         "exchange_info": exchange_info_out if args.include_exchange_info else {},
-        "trades": trades_out if args.include_trades else [],
+        "trades": trades_out,
     }
+    snapshot["diagnostics"] = {
+        "generated_at_utc": utc_now_iso(),
+        "error_diagnostics": build_error_diagnostics(errors),
+    }
+    snapshot["diagnostics"]["self_check"] = run_spot_self_check(snapshot)
 
     os.makedirs(os.path.dirname(out_json) or ".", exist_ok=True)
     with open(out_json, "w", encoding="utf-8") as f:
@@ -920,10 +1413,16 @@ def main() -> int:
         with open(out_txt, "w", encoding="utf-8-sig") as f:
             f.write(summary_txt)
 
-    if args.strict and critical_failures:
+    strict_self_check = deep_get(snapshot, "diagnostics.self_check", {}) or {}
+    strict_self_check_fail = str(strict_self_check.get("status") or "").upper() == "FAIL"
+    if args.strict and (critical_failures or strict_self_check_fail):
         print("STRICT MODE: critical failures:", file=sys.stderr)
         for k in critical_failures:
             print(f"  - {k}", file=sys.stderr)
+        if strict_self_check_fail:
+            print("STRICT MODE: self_check failed critical checks:", file=sys.stderr)
+            for item in strict_self_check.get("failed_critical", []) or []:
+                print(f"  - {item}", file=sys.stderr)
         print(f"Snapshot written: {out_json}", file=sys.stderr)
         if not args.no_text:
             print(f"Agent pack written: {agent_txt}", file=sys.stderr)
@@ -936,6 +1435,9 @@ def main() -> int:
         print(f"OK: summary -> {out_txt}")
     if errors:
         print(f"WARNING: errors_count={len(errors)} (see snapshot.errors)")
+    self_check_status = str(deep_get(snapshot, "diagnostics.self_check.status") or "UNKNOWN")
+    if self_check_status in ("WARN", "FAIL"):
+        print(f"WARNING: self_check_status={self_check_status} (see snapshot.diagnostics.self_check)")
     return 0
 
 
