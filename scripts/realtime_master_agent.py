@@ -184,7 +184,7 @@ def parse_final_decision(path: str) -> Dict[str, Any]:
     return out
 
 
-def stage_a_scan(watchlist_size: int) -> Tuple[List[str], str]:
+def stage_a_scan(watchlist_size: int) -> Tuple[List[str], List[str], str]:
     ts_utc = utc_now_iso()
     ts_tokyo = dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).isoformat()
     rows_24h, err24 = get_json("/api/v3/ticker/24hr")
@@ -207,12 +207,58 @@ def stage_a_scan(watchlist_size: int) -> Tuple[List[str], str]:
     usdt.sort(key=lambda x: sf(x.get("quoteVolume")) or 0.0, reverse=True)
     top60 = usdt[:60]
 
-    cand: List[Dict[str, Any]] = []
-    for r in top60[:18]:
+    qv_sorted = sorted([sf(x.get("quoteVolume")) or 0.0 for x in top60], reverse=True)
+    qv_floor = qv_sorted[min(len(qv_sorted) - 1, 35)] if qv_sorted else 0.0
+    min_qv = max(150_000.0, min(2_000_000.0, qv_floor))
+    qv_soft = max(50_000.0, min_qv * 0.33)
+    stable_like = {
+        "USDCUSDT",
+        "BUSDUSDT",
+        "FDUSDUSDT",
+        "USDPUSDT",
+        "TUSDUSDT",
+        "DAIUSDT",
+        "PAXGUSDT",
+    }
+    major_set = {"BTCUSDT", "ETHUSDT", "XRPUSDT"}
+
+    preselect: List[Dict[str, Any]] = []
+    for r in top60:
         sym = str(r.get("symbol"))
         qv = sf(r.get("quoteVolume")) or 0.0
-        if qv < 2_000_000:
+        if not sym or sym in stable_like or qv < min_qv:
             continue
+        b = bmap.get(sym, {})
+        bid = sf(b.get("bidPrice")) or 0.0
+        ask = sf(b.get("askPrice")) or 0.0
+        last = sf(r.get("lastPrice")) or 0.0
+        mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else last
+        spread = ((ask - bid) / mid * 10000.0) if mid > 0 and ask >= bid and bid > 0 else 999.0
+        if spread <= 0 or spread > 24.0:
+            continue
+        preselect.append({"row": r, "symbol": sym, "quote_volume": qv, "spread_bps": spread})
+
+    preselect.sort(key=lambda x: (x["quote_volume"], -x["spread_bps"]), reverse=True)
+    universe = preselect[:36] if len(preselect) > 36 else preselect
+    if len(universe) < 10:
+        universe = []
+        for r in top60[:36]:
+            sym = str(r.get("symbol"))
+            qv = sf(r.get("quoteVolume")) or 0.0
+            if sym and sym not in stable_like and qv >= qv_soft:
+                universe.append(
+                    {
+                        "row": r,
+                        "symbol": sym,
+                        "quote_volume": qv,
+                        "spread_bps": None,
+                    }
+                )
+    cand: List[Dict[str, Any]] = []
+    for item in universe:
+        r = item["row"]
+        sym = str(item["symbol"])
+        qv = sf(item["quote_volume"]) or 0.0
         t1, e1 = get_json("/api/v3/ticker", {"symbol": sym, "windowSize": "1h"})
         t4, e4 = get_json("/api/v3/ticker", {"symbol": sym, "windowSize": "4h"})
         dep, ed = get_json("/api/v3/depth", {"symbol": sym, "limit": 100})
@@ -268,25 +314,70 @@ def stage_a_scan(watchlist_size: int) -> Tuple[List[str], str]:
                 buy += q
         fr = buy / max(1e-9, sell)
         fi = (buy - sell) / max(1e-9, buy + sell)
-        if spread > 14.0:
+        if spread > 20.0:
             continue
-        if abs(ret1) < 0.08 and atr15 <= max(1e-9, last) * 0.0012:
+        if abs(ret1) < 0.05 and atr15 <= max(1e-9, last) * 0.0009:
             continue
+        long_ready = (t15 == "UP" and t5 == "UP" and fr >= 1.03 and fi > 0 and t1h in ("UP", "MIX"))
+        short_ready = (t15 == "DOWN" and t5 == "DOWN" and fr <= 0.97 and fi < 0 and t1h in ("DOWN", "MIX"))
+        core_ready = long_ready or short_ready
+        flow_aligned = ((t15 == "UP" and fr >= 1.03 and fi > 0) or (t15 == "DOWN" and fr <= 0.97 and fi < 0))
+        atr_pct = atr15 / max(1e-9, last)
         score = 0.0
-        score += min(25.0, math.log10(max(1.0, qv)) * 3.1)
-        score += min(22.0, abs(ret1) * 7.5 + abs(ret4) * 2.2)
-        score += 18.0 if (t5 == t15 and t15 in ("UP", "DOWN")) else 7.0
-        score += 15.0 if (t1h == t15 or t1h == "MIX") else 4.0
-        score += 14.0 if ((t15 == "UP" and fr >= 1.03 and fi > 0) or (t15 == "DOWN" and fr <= 0.97 and fi < 0)) else 5.0
-        score -= min(15.0, max(0.0, spread - 5.0) * 1.7)
+        score += min(22.0, math.log10(max(1.0, qv)) * 2.9)
+        score += min(24.0, abs(ret1) * 8.0 + abs(ret4) * 2.0 + atr_pct * 2200.0)
+        score += 20.0 if (t5 == t15 and t15 in ("UP", "DOWN")) else 8.0
+        score += 14.0 if (t1h == t15) else (10.0 if t1h == "MIX" else 3.0)
+        score += 15.0 if flow_aligned else 5.0
+        score += 10.0 if core_ready else 0.0
+        score -= min(16.0, max(0.0, spread - 5.0) * 1.6)
         if (fr <= 0.97 and imb >= 0.08) or (fr >= 1.03 and imb <= -0.08):
             score -= 10.0
-        cand.append({"symbol": sym, "score": round(score, 4)})
+        if qv < qv_soft and not core_ready:
+            continue
+        if sym in major_set and not core_ready:
+            score -= 4.0
+        if sym not in major_set and core_ready:
+            score += 3.0
+        cand.append(
+            {
+                "symbol": sym,
+                "score": round(score, 4),
+                "core_ready": core_ready,
+                "is_major": sym in major_set,
+                "quote_volume": round(qv, 4),
+                "spread_bps": round(spread, 4),
+                "ret_1h_pct": round(ret1, 6),
+                "ret_4h_pct": round(ret4, 6),
+            }
+        )
 
     if not cand:
         cand = [{"symbol": str(x.get("symbol")), "score": float(50 - i)} for i, x in enumerate(top60[:5])]
-    cand.sort(key=lambda x: x["score"], reverse=True)
-    watch = [x["symbol"] for x in cand[:watchlist_size]]
+    cand.sort(key=lambda x: (1 if x.get("core_ready") else 0, x.get("score", 0.0), x.get("quote_volume", 0.0)), reverse=True)
+    target_n = max(3, min(watchlist_size, len(cand)))
+    max_major = max(1, watchlist_size // 2)
+    watch: List[str] = []
+    major_count = 0
+    for x in cand:
+        sym = str(x.get("symbol"))
+        if not sym:
+            continue
+        is_major = sym in major_set
+        if is_major and major_count >= max_major:
+            continue
+        watch.append(sym)
+        if is_major:
+            major_count += 1
+        if len(watch) >= target_n:
+            break
+    if len(watch) < target_n:
+        for x in cand:
+            sym = str(x.get("symbol"))
+            if sym and sym not in watch:
+                watch.append(sym)
+            if len(watch) >= target_n:
+                break
     if len(watch) < 3:
         for x in top60:
             sym = str(x.get("symbol"))
@@ -294,21 +385,25 @@ def stage_a_scan(watchlist_size: int) -> Tuple[List[str], str]:
                 watch.append(sym)
             if len(watch) >= 3:
                 break
-    watch = watch[:watchlist_size]
+    watch = watch[:target_n]
     scan = {
         "scan_time_utc": ts_utc,
         "scan_time_tokyo": ts_tokyo,
         "source": "binance.us.spot",
+        "preselect_count": len(preselect),
+        "universe_count": len(universe),
+        "min_quote_volume": min_qv,
         "watchlist_symbols": watch,
-        "ranked": cand[:watchlist_size],
+        "ranked": cand[: max(watchlist_size, 10)],
         "errors_summary": errors[:30],
     }
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     scan_path = os.path.join(LOG_DIR, f"scan_watchlist_{stamp}.json")
     os.makedirs(LOG_DIR, exist_ok=True)
+    ranked_symbols = [str(x.get("symbol")) for x in cand if str(x.get("symbol"))]
     with open(scan_path, "w", encoding="utf-8") as f:
         json.dump(scan, f, ensure_ascii=False, indent=2)
-    return watch, scan_path
+    return watch, ranked_symbols, scan_path
 
 
 def build_analysis(snapshot_path: str, symbol: str) -> str:
@@ -460,19 +555,58 @@ def stage_b_symbol(symbol: str) -> Dict[str, Any]:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Realtime 0_master_prompt runner")
     ap.add_argument("--watchlist-size", type=int, default=5)
+    ap.add_argument("--tradeable-only", action="store_true", help="Only output LONG/SHORT symbols after guard.")
+    ap.add_argument("--min-confidence", type=float, default=68.0, help="Minimum confidence for tradeable-only output.")
+    ap.add_argument("--max-candidates", type=int, default=20, help="Max symbols analyzed when tradeable-only is enabled.")
     args = ap.parse_args()
     os.makedirs(LOG_DIR, exist_ok=True)
-    watch, scan_path = stage_a_scan(max(3, min(args.watchlist_size, 5)))
-    print(f"WATCHLIST_SYMBOLS={' '.join(watch)}")
+    watch_n = max(3, min(args.watchlist_size, 5))
+    watch, ranked_symbols, scan_path = stage_a_scan(watch_n)
+    print(f"STAGEA_WATCHLIST_SYMBOLS={' '.join(watch)}")
     results: List[Dict[str, Any]] = []
-    for sym in watch:
+    candidate_symbols: List[str] = []
+    for sym in watch + ranked_symbols:
+        if sym and sym not in candidate_symbols:
+            candidate_symbols.append(sym)
+    if args.tradeable_only:
+        max_candidates = max(watch_n, min(max(8, args.max_candidates), len(candidate_symbols)))
+        run_symbols = candidate_symbols[:max_candidates]
+    else:
+        run_symbols = watch
+
+    final_watch: List[str] = []
+    for sym in run_symbols:
         r = stage_b_symbol(sym)
         results.append(r)
         print(f"AGENT_PATH = {r['agent_path']}")
         print(f"ANALYSIS_PATH = {r['analysis_path']}")
+        if args.tradeable_only:
+            action = str(r.get("action", "WAIT")).upper()
+            conf = sf(r.get("confidence")) or 0.0
+            dq = str(r.get("data_quality", "UNKNOWN")).upper()
+            if action in ("LONG", "SHORT") and conf >= args.min_confidence and dq in ("HIGH", "MED"):
+                final_watch.append(sym)
+                if len(final_watch) >= watch_n:
+                    break
+    if not args.tradeable_only:
+        final_watch = watch
+    print(f"WATCHLIST_SYMBOLS={' '.join(final_watch)}")
     res_path = os.path.join(LOG_DIR, f"master_realtime_run_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
     with open(res_path, "w", encoding="utf-8") as f:
-        json.dump({"scan_path": scan_path, "watchlist_symbols": watch, "results": results, "run_time_utc": utc_now_iso()}, f, ensure_ascii=False, indent=2)
+        json.dump(
+            {
+                "scan_path": scan_path,
+                "stagea_watchlist_symbols": watch,
+                "watchlist_symbols": final_watch,
+                "tradeable_only": args.tradeable_only,
+                "min_confidence": args.min_confidence,
+                "results": results,
+                "run_time_utc": utc_now_iso(),
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
     print(f"SCAN_PATH={os.path.abspath(scan_path)}")
     print(f"RESULT_PATH={os.path.abspath(res_path)}")
     return 0
