@@ -33,6 +33,7 @@ LOG_DIR = os.path.join(ROOT, "logs")
 FLOW_LONG_MIN = 1.03
 FLOW_SHORT_MAX = 0.97
 DEPTH_DIVERGENCE_TH = 0.08
+TOP_IMB_DIVERGENCE_TH = 0.20
 SHORT_REBOUND_RSI1H_MAX = 34.0
 ENTRY_MISMATCH_ATR_MULT = 0.25
 
@@ -149,6 +150,7 @@ def compute_guard(rec: Dict[str, Any], snapshot: Dict[str, Any]) -> Dict[str, An
     flow_ratio = safe_float(deep_get(snapshot, "flow.trade_features.buy_sell_ratio"))
     flow_imb = safe_float(deep_get(snapshot, "flow.trade_features.imbalance_qty"))
     depth_imb = safe_float(deep_get(snapshot, "features.order_book.imbalance"))
+    top_imb = safe_float(deep_get(snapshot, "features.book_ticker.imbalance_top"))
 
     rsi_1h = safe_float(deep_get(snapshot, "features.by_interval.1h.rsi14_last"))
     ret_1h = safe_float(deep_get(snapshot, "features.ticker_window.h1.price_change_pct"))
@@ -213,9 +215,17 @@ def compute_guard(rec: Dict[str, Any], snapshot: Dict[str, Any]) -> Dict[str, An
         if flow_ratio >= FLOW_LONG_MIN and depth_imb <= -DEPTH_DIVERGENCE_TH:
             hard_blockers.append("flow_depth_divergence_bull_flow_vs_ask_depth")
 
+    # Top-of-book imbalance captures thinner liquidity turns earlier than depth average.
+    if flow_ratio is not None and top_imb is not None:
+        if flow_ratio <= FLOW_SHORT_MAX and top_imb >= TOP_IMB_DIVERGENCE_TH:
+            hard_blockers.append("flow_top_divergence_bear_flow_vs_top_bid")
+        if flow_ratio >= FLOW_LONG_MIN and top_imb <= -TOP_IMB_DIVERGENCE_TH:
+            hard_blockers.append("flow_top_divergence_bull_flow_vs_top_ask")
+
     if entry_mid_diff_atr is not None and entry_mid_diff_atr > ENTRY_MISMATCH_ATR_MULT:
         hard_blockers.append("entry_price_mismatch_vs_book_mid")
 
+    hard_blockers = list(dict.fromkeys(hard_blockers))
     blocked = action in ("LONG", "SHORT") and len(hard_blockers) > 0
     if blocked:
         expected_action = "WAIT"
@@ -234,6 +244,7 @@ def compute_guard(rec: Dict[str, Any], snapshot: Dict[str, Any]) -> Dict[str, An
             "flow_ratio": flow_ratio,
             "flow_imbalance_qty": flow_imb,
             "depth_imbalance": depth_imb,
+            "top_imbalance": top_imb,
             "rsi_1h": rsi_1h,
             "ret_1h_pct": ret_1h,
             "entry": entry,
@@ -245,6 +256,27 @@ def compute_guard(rec: Dict[str, Any], snapshot: Dict[str, Any]) -> Dict[str, An
         "long_core": long_core,
         "short_core": short_core,
     }
+
+
+def blocker_repair_actions(blockers: List[str]) -> List[str]:
+    actions: List[str] = []
+    for b in blockers:
+        if b.startswith("long_core_incomplete:"):
+            actions.append("LONG core incomplete: tighten filters or switch to WAIT.")
+        elif b.startswith("short_core_incomplete:"):
+            actions.append("SHORT core incomplete: tighten filters or switch to WAIT.")
+        elif b == "short_rebound_risk":
+            actions.append("Short rebound risk: avoid chasing short when 1h RSI is low and 1h return is non-negative.")
+        elif "flow_depth_divergence" in b:
+            actions.append("Flow-depth divergence: reduce flow weight and wait for orderbook alignment.")
+        elif "flow_top_divergence" in b:
+            actions.append("Flow-top divergence: reduce size or WAIT until top imbalance realigns.")
+        elif b == "entry_price_mismatch_vs_book_mid":
+            actions.append("Entry mismatch vs book_mid: use a tighter limit entry near book_mid.")
+        else:
+            actions.append(f"Unclassified blocker: {b}. Review manually and add a rule if needed.")
+    # 去重并保持顺序
+    return list(dict.fromkeys(actions))
 
 
 def rewrite_final_decision(text: str, action: str, confidence: int, data_quality: Optional[str], wait_reason: str, note: str) -> str:
@@ -367,6 +399,7 @@ def main() -> int:
         snapshot = json.load(f)
 
     guard = compute_guard(rec, snapshot)
+    repair_actions = blocker_repair_actions(guard.get("hard_blockers", []))
     status = "PASS"
     note = "guard_pass"
 
@@ -404,6 +437,7 @@ def main() -> int:
         "analysis_path": out_path,
         "snapshot_path": os.path.abspath(snapshot_path),
         "guard": guard,
+        "repair_actions": repair_actions,
     }
     with open(guard_report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
@@ -415,6 +449,7 @@ def main() -> int:
     print(f"guard_action={guard.get('guard_action')}")
     print(f"blocked={guard.get('blocked')}")
     print(f"hard_blockers={guard.get('hard_blockers')}")
+    print(f"repair_actions={repair_actions}")
 
     if status == "FAIL":
         return 2

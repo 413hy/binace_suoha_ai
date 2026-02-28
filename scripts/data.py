@@ -625,10 +625,17 @@ def parse_agg_trades(rows: Any) -> List[Dict[str, Any]]:
 
 
 def trade_flow_features(recent: List[Dict[str, Any]], agg: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
-    buy_qty = 0.0
-    sell_qty = 0.0
-    buy_notional = 0.0
-    sell_notional = 0.0
+    # Prefer a single dominant feed for flow ratio to avoid double-counting bias.
+    buy_qty_recent = 0.0
+    sell_qty_recent = 0.0
+    buy_notional_recent = 0.0
+    sell_notional_recent = 0.0
+
+    buy_qty_agg = 0.0
+    sell_qty_agg = 0.0
+    buy_notional_agg = 0.0
+    sell_notional_agg = 0.0
+
     recent_cnt = 0
     agg_cnt = 0
     last_ts = None
@@ -643,11 +650,11 @@ def trade_flow_features(recent: List[Dict[str, Any]], agg: List[Dict[str, Any]])
         n = q * p
         # isBuyerMaker=True => seller aggressor; False => buyer aggressor
         if is_bm:
-            sell_qty += q
-            sell_notional += n
+            sell_qty_recent += q
+            sell_notional_recent += n
         else:
-            buy_qty += q
-            buy_notional += n
+            buy_qty_recent += q
+            buy_notional_recent += n
         ts = t.get("time_ms")
         if isinstance(ts, int) and (last_ts is None or ts > last_ts):
             last_ts = ts
@@ -661,14 +668,37 @@ def trade_flow_features(recent: List[Dict[str, Any]], agg: List[Dict[str, Any]])
         agg_cnt += 1
         n = q * p
         if m:
-            sell_qty += q
-            sell_notional += n
+            sell_qty_agg += q
+            sell_notional_agg += n
         else:
-            buy_qty += q
-            buy_notional += n
+            buy_qty_agg += q
+            buy_notional_agg += n
         ts = t.get("time_ms")
         if isinstance(ts, int) and (last_ts is None or ts > last_ts):
             last_ts = ts
+
+    flow_source = "combined"
+    buy_qty = buy_qty_recent + buy_qty_agg
+    sell_qty = sell_qty_recent + sell_qty_agg
+    buy_notional = buy_notional_recent + buy_notional_agg
+    sell_notional = sell_notional_recent + sell_notional_agg
+
+    denom_recent = buy_qty_recent + sell_qty_recent
+    denom_agg = buy_qty_agg + sell_qty_agg
+
+    # Agg-trades are the preferred source when sample size is sufficient.
+    if agg_cnt >= 80 and denom_agg > 0:
+        flow_source = "agg"
+        buy_qty = buy_qty_agg
+        sell_qty = sell_qty_agg
+        buy_notional = buy_notional_agg
+        sell_notional = sell_notional_agg
+    elif recent_cnt >= 80 and denom_recent > 0:
+        flow_source = "recent"
+        buy_qty = buy_qty_recent
+        sell_qty = sell_qty_recent
+        buy_notional = buy_notional_recent
+        sell_notional = sell_notional_recent
 
     denom_qty = buy_qty + sell_qty
     denom_notional = buy_notional + sell_notional
@@ -677,8 +707,13 @@ def trade_flow_features(recent: List[Dict[str, Any]], agg: List[Dict[str, Any]])
     imbalance_notional = ((buy_notional - sell_notional) / denom_notional) if denom_notional > 0 else None
 
     return {
+        "flow_source": flow_source,
         "recent_count": float(recent_cnt),
         "agg_count": float(agg_cnt),
+        "buy_qty_recent": buy_qty_recent if denom_recent > 0 else None,
+        "sell_qty_recent": sell_qty_recent if denom_recent > 0 else None,
+        "buy_qty_agg": buy_qty_agg if denom_agg > 0 else None,
+        "sell_qty_agg": sell_qty_agg if denom_agg > 0 else None,
         "buy_qty": buy_qty if denom_qty > 0 else None,
         "sell_qty": sell_qty if denom_qty > 0 else None,
         "buy_notional": buy_notional if denom_notional > 0 else None,
